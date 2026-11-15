@@ -1,13 +1,10 @@
-
 {
   "name": "erensi-bot",
   "version": "1.0.0",
-  "description": "Erensi - Budd.io bot",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=18"
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "ffmpeg-static": "^5.2.0"
   }
 }
