@@ -54,11 +54,11 @@ const SHOW = 5; // arama sonucu sayısı
 const fmt = s => { s = Math.floor(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 const fmtP = s => { s = Math.floor(s || 0); if (!s) return '--:--'; return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
 const cut = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
-const ALLOWED = /^https?:\/\/([\w-]+\.)?(youtube\.com|youtu\.be|soundcloud\.com|music\.youtube\.com)\//i;
-const SRC = { yt: { name: 'YouTube', pre: 'ytsearch' }, sc: { name: 'SoundCloud', pre: 'scsearch' } };
+const ALLOWED = /^https?:\/\/([\w-]+\.)?(soundcloud\.com|snd\.sc)\//i;
+const SRC = { sc: { name: 'SoundCloud', pre: 'scsearch' } };
 
 /* ---------- yt-dlp ---------- */
-const YT_ARGS = ['--extractor-args', 'youtube:player_client=tv,android,web'];
+const YT_ARGS = [];
 function runYtdlp(args, timeout = 40000) {
   return new Promise((ok, no) => {
     execFile(YTDLP, args, { maxBuffer: 30 << 20, timeout }, (err, out, errout) => {
@@ -93,12 +93,7 @@ async function searchList(src, q) {
   if (!list.length) throw new Error('sonuç yok');
   return list.slice(0, SHOW);
 }
-// Kaynak seçilmediyse sırayla dene: YouTube -> SoundCloud (Render gibi IP'lerde YouTube engelleyebilir)
-async function smartSearch(q) {
-  let last;
-  for (const src of ['yt', 'sc']) { try { return { src, items: await searchList(src, q) }; } catch (e) { last = e; } }
-  throw new Error('Şarkı bulunamadı (' + ((last && last.message) || '?') + ')');
-}
+async function smartSearch(q) { return { src: 'sc', items: await searchList('sc', q) }; }
 
 /* ---------- oturumlar (her Budd bağlantısı bir oturum) ---------- */
 const sessions = new Map(); // ws -> S
@@ -174,14 +169,10 @@ function pickerMsg(S, sid) {
     embeds: [{
       description: `${SRC[s.src].name} sonuçları gösteriliyor. Aşağıdaki butonlardan bir şarkı seç.\n\n${lines}`,
       color: 0x2ec4b6,
-      footer: { text: 'Kaynak: ' + (s.auto ? 'Akıllı Arama' : SRC[s.src].name) },
+      footer: { text: 'Kaynak: SoundCloud' },
     }],
     components: [
       { type: 1, components: nums },
-      { type: 1, components: [
-        { type: 2, style: 1, label: "YouTube'da ara", custom_id: `src:${sid}:yt` },
-        { type: 2, style: 1, label: "SoundCloud'da ara", custom_id: `src:${sid}:sc` },
-      ] },
     ],
   };
 }
@@ -197,7 +188,6 @@ async function addTrack(S, replyTo, track, user, chName) {
   if (S.q.length >= MAXQ) return say(S, replyTo, 'Sıra dolu.');
   if (!ALLOWED.test(track.url || '')) return say(S, replyTo, '⛔ Bu bağlantı desteklenmiyor.');
   // süre/kapak eksikse tam bilgiyi çek
-  if (!track.dur || !track.thumb) { try { const f = await ytdlpJson(track.url); track = Object.assign({}, f, { title: track.title || f.title }); } catch {} }
   track.req = user || 'biri';
   // Bot sesli odaya girer: adı + profiliyle görünür, kendini sessize alır, sağırlaştırır (oda boşsa ilk ses kanalı)
   send(S, { op: 'action', d: { act: 'join', ch: chName || '', mute: true, deaf: true } });
@@ -217,10 +207,7 @@ async function onCommand(S, id, name, opts, args, user) {
       S.oda = opts.oda || '';
       // Link verildiyse liste göstermeden direkt çal
       if (ALLOWED.test(q)) {
-        say(S, id, '🔎 Bağlantı çözülüyor…', null, { id: 'l_' + id, flags: 64 });
-        let t;
-        try { t = await ytdlpJson(q); } catch (e) { return say(S, id, '⛔ ' + e.message, null, { edit: 'l_' + id, flags: 64 }); }
-        say(S, id, '✅ Bulundu: **' + cut(t.title, 80) + '**', null, { edit: 'l_' + id, flags: 64 });
+        const t = { title: q.replace(/^https?:\/\/(www\.)?/i, '').slice(0, 80), url: q, dur: 0, by: '', thumb: '' };
         return addTrack(S, id, t, user, S.oda);
       }
       // Aksi halde butonlu sonuç listesi (sadece komutu yazan görür)
@@ -278,15 +265,6 @@ async function onComponent(S, id, data, user) {
   const mid = data.message_id || (s && s.mid) || ('s_' + a);
   if (!s) return say(S, id, 'Bu arama süresi doldu, /cal ile tekrar ara.', null, { flags: 64 });
   const edit = (extra) => send(S, { op: 'message', d: Object.assign({ reply_to: id, content: '', edit: mid, flags: 64 }, extra) });
-  // Kaynak değiştir (YouTube / SoundCloud)
-  if (kind === 'src') {
-    if (!SRC[b]) return;
-    edit({ content: '🔎 ' + SRC[b].name + "'da aranıyor…", embeds: [], components: [] });
-    try { s.items = await searchList(b, s.q); s.src = b; s.auto = false; }
-    catch (e) { s.items = s.items || []; return edit({ content: '⛔ ' + SRC[b].name + ' sonuç vermedi (' + e.message + ').', embeds: [], components: [] }); }
-    const m = pickerMsg(S, a);
-    return edit({ embeds: m.embeds, components: m.components });
-  }
   // Şarkı seç
   if (kind === 'pick') {
     const t = s.items[+b];
@@ -325,7 +303,7 @@ const server = http.createServer((req, res) => {
     let out = y.stdout, f = null;
     cur = [y];
     if (FFMPEG_OK) {
-      f = spawn(FFMPEG, ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      f = spawn(FFMPEG, ['-loglevel', 'error', '-fflags', 'nobuffer', '-flags', 'low_delay', '-probesize', '32768', '-analyzeduration', '0', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-flush_packets', '1', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
       f.stderr.on('data', d => { errF = (errF + d).slice(-600); });
       f.on('error', er => { errF += 'ffmpeg başlatılamadı: ' + er.message; });
       y.stdout.pipe(f.stdin); f.stdin.on('error', () => {});
@@ -335,8 +313,7 @@ const server = http.createServer((req, res) => {
     out.on('data', c => { got += c.length; if (!bytes) { console.log('akış başladı', Date.now() - T0, 'ms'); armTimer(S, e.gen); } bytes += c.length; if (!closed) res.write(c); });
     (f || y).on('close', () => {
       if (closed || S.gen !== e.gen) return;
-      if (!got && attempt === 0) { console.error('1. deneme boş:', errY, errF); attempt = 1; return run(); }
-      closed = true; res.end();
+            closed = true; res.end();
       if (!got) {
         const why = (errY.trim().split('\n').pop() || errF.trim().split('\n').pop() || 'bilinmeyen hata');
         console.error('akış boş döndü:', errY, errF);
@@ -373,4 +350,4 @@ wss.on('connection', ws => {
 
 server.listen(PORT, () => console.log(`Budd müzik botu :${PORT}  (public: ${PUBLIC})`));
 process.on('unhandledRejection', e => console.error(e));
-                                                       
+    
