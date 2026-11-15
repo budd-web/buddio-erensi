@@ -41,18 +41,25 @@ const fmt = s => { s = Math.floor(s || 0); return `${Math.floor(s / 60)}:${Strin
 const ALLOWED = /^https?:\/\/([\w-]+\.)?(youtube\.com|youtu\.be|soundcloud\.com|music\.youtube\.com)\//i;
 
 /* ---------- arama ---------- */
-function search(q) {
-  const target = ALLOWED.test(q) ? q : `ytsearch1:${q}`;
+function ytdlpJson(target) {
   return new Promise((ok, no) => {
-    execFile(YTDLP, ['--no-playlist', '--no-warnings', '-j', '--skip-download', '--', target],
-      { maxBuffer: 20 << 20, timeout: 30000 }, (err, out) => {
-        if (err) return no(new Error('Şarkı bulunamadı'));
+    execFile(YTDLP, ['--no-playlist', '--no-warnings', '-j', '--skip-download',
+      '--extractor-args', 'youtube:player_client=tv,android,web', '--', target],
+      { maxBuffer: 20 << 20, timeout: 40000 }, (err, out, errout) => {
+        if (err) { const msg = String(errout || err.message).trim().split('\n').pop().slice(0, 200); console.error('yt-dlp hata [' + target.slice(0, 40) + ']:', msg); return no(new Error(msg)); }
         try {
           const j = JSON.parse(out.trim().split('\n')[0]);
           ok({ title: j.title, url: j.webpage_url || j.original_url, dur: j.duration || 0, by: j.uploader || '', thumb: j.thumbnail || '' });
-        } catch { no(new Error('Şarkı bulunamadı')); }
+        } catch { no(new Error('Çözümlenemedi')); }
       });
   });
+}
+// Sırayla dene: YouTube -> SoundCloud (Render gibi sunucu IP'lerinde YouTube engelleyebilir)
+async function search(q) {
+  const targets = ALLOWED.test(q) ? [q] : [`ytsearch1:${q}`, `scsearch1:${q}`];
+  let last;
+  for (const t of targets) { try { return await ytdlpJson(t); } catch (e) { last = e; } }
+  throw new Error('Şarkı bulunamadı (' + (last && last.message || '?') + ')');
 }
 
 /* ---------- oturumlar (her Budd bağlantısı bir oturum) ---------- */
@@ -167,4 +174,4 @@ wss.on('connection', ws => {
 
 server.listen(PORT, () => console.log(`Budd müzik botu :${PORT}  (public: ${PUBLIC})`));
 process.on('unhandledRejection', e => console.error(e));
-        
+                                     
