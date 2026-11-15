@@ -45,6 +45,9 @@ async function ensureYtdlp() {
   } catch (e) { console.error('yt-dlp indirilemedi:', e.message); }
 }
 ensureYtdlp();
+let FFMPEG_OK = true;
+(function () { try { const r = require('child_process').spawnSync(FFMPEG, ['-version']); FFMPEG_OK = r.status === 0; } catch { FFMPEG_OK = false; }
+  console.log(FFMPEG_OK ? 'ffmpeg bulundu' : 'UYARI: ffmpeg yok -> ham webm akıtılacak (npm i ffmpeg-static önerilir)'); })();
 const MAXQ = 50;
 const SHOW = 5; // arama sonucu sayısı
 
@@ -305,15 +308,35 @@ const server = http.createServer((req, res) => {
   if (!e || e.S.gen !== e.gen) { res.writeHead(404); return res.end(); }
   const S = e.S;
   if (S.proc) for (const p of S.proc) { try { p.kill('SIGKILL'); } catch {} } // yeniden istek: baştan başlat
-  const y = spawn(YTDLP, ['-f', 'bestaudio/best', '--no-playlist', '--no-warnings', '-q', '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'ignore'] });
-  const f = spawn(FFMPEG, ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
-  S.proc = [y, f];
-  y.stdout.pipe(f.stdin); f.stdin.on('error', () => {}); y.on('error', () => {}); f.on('error', () => {});
-  res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
+  const T0 = Date.now();
+  let errY = '', errF = '', bytes = 0, closed = false, ffOk = true;
+  // ffmpeg var mı? Yoksa ham ses (webm/opus) akıtılır; tarayıcılar bunu çalabilir.
+  const y = spawn(YTDLP, ['-f', ffOk && FFMPEG_OK ? 'bestaudio/best' : 'bestaudio[ext=webm]/bestaudio', '--no-playlist', '--no-warnings', '-q', ...YT_ARGS, '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'pipe'] });
+  y.stderr.on('data', d => { errY += d; if (errY.length > 600) errY = errY.slice(-600); });
+  y.on('error', er => { errY += 'yt-dlp başlatılamadı: ' + er.message; });
+  let out = y.stdout, f = null;
+  if (FFMPEG_OK) {
+    f = spawn(FFMPEG, ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    f.stderr.on('data', d => { errF += d; if (errF.length > 600) errF = errF.slice(-600); });
+    f.on('error', er => { errF += 'ffmpeg başlatılamadı: ' + er.message; });
+    y.stdout.pipe(f.stdin); f.stdin.on('error', () => {});
+    out = f.stdout;
+  }
+  y.stdout.on('error', () => {});
+  S.proc = f ? [y, f] : [y];
+  res.writeHead(200, { 'Content-Type': FFMPEG_OK ? 'audio/mpeg' : 'audio/webm', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
   let first = true;
-  f.stdout.on('data', c => { if (first) { first = false; armTimer(S, e.gen); } res.write(c); });
-  f.on('close', () => { res.end(); if (!e.track.dur && S.gen === e.gen) setTimeout(() => { if (S.gen === e.gen) playNext(S, null); }, 1500); });
-  res.on('close', () => { try { y.kill('SIGKILL'); f.kill('SIGKILL'); } catch {} });
+  out.on('data', c => { bytes += c.length; if (first) { first = false; console.log('akış başladı', Date.now() - T0, 'ms'); armTimer(S, e.gen); } res.write(c); });
+  const done = () => {
+    if (closed) return; closed = true; res.end();
+    if (!bytes && S.gen === e.gen) {
+      const why = (errY + ' ' + errF).trim().split('\n').pop() || 'bilinmeyen hata';
+      console.error('akış boş döndü:', errY, errF);
+      say(S, null, '⛔ Ses akışı alınamadı: ' + cut(why, 180));
+    } else if (!e.track.dur && S.gen === e.gen) setTimeout(() => { if (S.gen === e.gen) playNext(S, null); }, 1500);
+  };
+  (f || y).on('close', done);
+  res.on('close', () => { try { y.kill('SIGKILL'); if (f) f.kill('SIGKILL'); } catch {} });
 });
 
 /* ---------- WebSocket gateway ---------- */
@@ -342,4 +365,3 @@ wss.on('connection', ws => {
 
 server.listen(PORT, () => console.log(`Budd müzik botu :${PORT}  (public: ${PUBLIC})`));
 process.on('unhandledRejection', e => console.error(e));
-                        
