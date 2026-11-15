@@ -1,156 +1,156 @@
-// Budd moderasyon botu — HTTP endpoint, bağımlılık YOK (Node 18+)
-// Çalıştır:  MODS="SenAdin,DigerYetkili" PORT=3000 node modbot.js
-// Portal → Genel Bilgi → Endpoint URL: https://SUNUCUN/   (https + CORS şart, aşağıda CORS hazır)
-// Portal → Bot → "Mesaj İçeriği Intent'i" AÇIK olmalı (otomatik moderasyon için)
-// Önek: "/"  (Genel Bilgi → Komut öneki)
-
+/**
+ * Budd.io Müzik Botu (tek dosya, Node 18+)
+ *
+ * Nasıl çalışır: Budd, Gateway URL'ine WebSocket ile bağlanır. Komutu yazan kişiye
+ * bot "ses odasına gir" ve "şu URL'yi çal" eylemlerini yollar. Bu dosya aynı portta
+ * hem WebSocket gateway'i hem de şarkıyı yt-dlp + ffmpeg ile mp3 akışına çeviren
+ * HTTP ucunu sunar. Tam şarkı çalar (YouTube / SoundCloud), isimle arar.
+ *
+ * Gereksinim:  npm i ws        +  sistemde  yt-dlp  ve  ffmpeg
+ * Çalıştır:    PUBLIC_URL=https://botun.alanadin.com node budd-muzik-bot.js
+ *   (PUBLIC_URL, bu sunucuya HTTPS ile dışarıdan erişilen adres olmalı; Budd https
+ *    olduğu için http://ip:port çalışmaz. Cloudflare Tunnel / Caddy / nginx kullan.)
+ * Budd Portal > Genel Bilgi > Gateway URL:  wss://botun.alanadin.com
+ */
 const http = require('http');
-const fs = require('fs');
+const crypto = require('crypto');
+const { spawn, execFile } = require('child_process');
+const { WebSocketServer } = require('ws');
 
-const PORT = +process.env.PORT || 3000;
-const MODS = (process.env.MODS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-const DB_FILE = process.env.DB || './modbot-data.json';
-const MAX_WARN = 3;
+const PORT = +process.env.PORT || 8080;
+const PUBLIC = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
+const YTDLP = process.env.YTDLP || 'yt-dlp';
+const FFMPEG = process.env.FFMPEG || 'ffmpeg';
+const MAXQ = 50;
 
-// ---------- kalıcı veri (sunucu başına) ----------
-let DB = {};
-try { DB = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) {}
-const save = () => { try { fs.writeFileSync(DB_FILE, JSON.stringify(DB)); } catch (e) { console.error('kayıt hatası', e.message); } };
-const G = id => DB[id] || (DB[id] = { warns: {}, words: [], auto: true, links: false, log: [] });
+const fmt = s => { s = Math.floor(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+const ALLOWED = /^https?:\/\/([\w-]+\.)?(youtube\.com|youtu\.be|soundcloud\.com|music\.youtube\.com)\//i;
 
-const norm = s => String(s || '').trim().replace(/^@/, '').toLowerCase();
-const isMod = u => !!u && MODS.includes(String(u.username || '').toLowerCase());
-const spam = {}; // "guild:user" -> [zaman damgaları]
-
-// ---------- yardımcılar ----------
-const msg = (content, extra) => Object.assign({ content }, extra || {});
-const embed = (title, description, color, fields) => ({ embeds: [{ title, description, color: color || 0x5865f2, fields: fields || [] }] });
-const priv = m => Object.assign(m, { flags: 64 }); // sadece komutu yazan görür
-
-function addWarn(g, who, reason, by) {
-  const k = norm(who), a = g.warns[k] = g.warns[k] || [];
-  a.push({ r: String(reason || 'Sebep yok').slice(0, 200), by, t: Date.now() });
-  g.log.push({ t: Date.now(), who: k, r: reason, by }); g.log = g.log.slice(-200);
-  save();
-  return a.length;
-}
-function warnText(who, n, reason) {
-  let t = `⚠️ **${who}** uyarıldı (${n}/${MAX_WARN}). Sebep: ${reason}`;
-  if (n >= MAX_WARN) t += `\n🚨 ${who} ${MAX_WARN} uyarıya ulaştı. Yetkililer lütfen işlem yapsın (sustur/at/yasakla).`;
-  return msg(t);
-}
-
-// ---------- komutlar ----------
-const HELP = [
-  ['/yardim', 'Bu listeyi gösterir'],
-  ['/ping', 'Bot çalışıyor mu?'],
-  ['/kurallar', 'Sunucu kurallarını gösterir'],
-  ['/bilgi <kullanıcı>', 'Kullanıcının uyarı özeti'],
-  ['/uyarilar <kullanıcı>', 'Uyarı listesi'],
-  ['/uyar <kullanıcı> <sebep>', '[YETKİLİ] Uyarı ver'],
-  ['/uyarisil <kullanıcı>', '[YETKİLİ] Uyarıları sıfırla'],
-  ['/kelime ekle|sil|liste <kelime>', '[YETKİLİ] Yasaklı kelime listesi'],
-  ['/automod ac|kapat|link-ac|link-kapat|durum', '[YETKİLİ] Otomatik moderasyon ayarları'],
-  ['/kayit', '[YETKİLİ] Son moderasyon kayıtları']
-];
-
-function command(body) {
-  const { data, user, guild } = body, g = G(guild && guild.id || 'x'), a = data.args || [], name = data.name;
-  const need = () => !isMod(user) && priv(msg('⛔ Bu komut için yetkili olman gerekir.'));
-
-  switch (name) {
-    case 'ping': return msg('🏓 Pong! ' + (user && user.username || ''));
-    case 'yardim': case 'help':
-      return embed('Moderasyon botu', HELP.map(h => '`' + h[0] + '` — ' + h[1]).join('\n'));
-    case 'kurallar':
-      return embed('📜 Sunucu kuralları', '1. Saygılı ol.\n2. Spam yapma.\n3. Küfür ve hakaret yasak.\n4. Reklam/link paylaşma.\n5. Yetkililerin kararına uy.', 0xf0b232);
-    case 'uyar': {
-      const d = need(); if (d) return d;
-      if (!a[0]) return priv(msg('Kullanım: /uyar <kullanıcı> <sebep>'));
-      const reason = a.slice(1).join(' ') || 'Sebep belirtilmedi';
-      return warnText(a[0].replace(/^@/, ''), addWarn(g, a[0], reason, user.username), reason);
-    }
-    case 'uyarilar': case 'bilgi': {
-      const who = a[0] || user.username, w = g.warns[norm(who)] || [];
-      if (!w.length) return msg(`✅ **${who}** için uyarı yok.`);
-      return embed(`${who} — ${w.length}/${MAX_WARN} uyarı`, w.slice(-10).map((x, i) =>
-        `**${i + 1}.** ${x.r} _(${x.by}, ${new Date(x.t).toLocaleString('tr-TR')})_`).join('\n'), 0xed4245);
-    }
-    case 'uyarisil': {
-      const d = need(); if (d) return d;
-      if (!a[0]) return priv(msg('Kullanım: /uyarisil <kullanıcı>'));
-      delete g.warns[norm(a[0])]; save();
-      return msg(`🧹 **${a[0]}** kullanıcısının uyarıları silindi.`);
-    }
-    case 'kelime': {
-      const d = need(); if (d) return d;
-      const act = (a[0] || '').toLowerCase(), w = norm(a.slice(1).join(' '));
-      if (act === 'liste') return priv(msg(g.words.length ? 'Yasaklı: ' + g.words.map(x => '`' + x + '`').join(', ') : 'Liste boş.'));
-      if (!w) return priv(msg('Kullanım: /kelime ekle|sil|liste <kelime>'));
-      if (act === 'ekle') { if (!g.words.includes(w)) g.words.push(w); save(); return priv(msg('➕ Eklendi: `' + w + '`')); }
-      if (act === 'sil') { g.words = g.words.filter(x => x !== w); save(); return priv(msg('➖ Silindi: `' + w + '`')); }
-      return priv(msg('Kullanım: /kelime ekle|sil|liste <kelime>'));
-    }
-    case 'automod': {
-      const d = need(); if (d) return d;
-      const s = (a[0] || 'durum').toLowerCase();
-      if (s === 'ac') g.auto = true; else if (s === 'kapat') g.auto = false;
-      else if (s === 'link-ac') g.links = true; else if (s === 'link-kapat') g.links = false;
-      save();
-      return priv(msg(`Otomatik moderasyon: **${g.auto ? 'AÇIK' : 'KAPALI'}** · Link engeli: **${g.links ? 'AÇIK' : 'KAPALI'}**`));
-    }
-    case 'kayit': {
-      const d = need(); if (d) return d;
-      return priv(msg(g.log.slice(-10).map(l => `• ${new Date(l.t).toLocaleTimeString('tr-TR')} ${l.who}: ${l.r}`).join('\n') || 'Kayıt yok.'));
-    }
-    default: return priv(msg('Bilinmeyen komut: `' + name + '`. `/yardim` yaz.'));
-  }
-}
-
-// ---------- otomatik moderasyon (message_create) ----------
-function automod(body) {
-  const { data, user, guild } = body, text = String(data.content || ''), g = G(guild && guild.id || 'x');
-  if (!g.auto || !user || isMod(user) || !text) return {};
-  const who = user.username, low = text.toLowerCase();
-  let reason = '';
-
-  const bad = g.words.find(w => low.includes(w));
-  if (bad) reason = 'Yasaklı kelime kullanımı';
-  else if (g.links && /(https?:\/\/|www\.|discord\.gg\/)/i.test(text)) reason = 'Link paylaşımı yasak';
-  else if (text.length >= 12 && (text.replace(/[^A-ZÇĞİÖŞÜ]/g, '').length / text.replace(/[^A-Za-zÇĞİÖŞÜçğıöşü]/g, '').length || 0) > 0.7) reason = 'Aşırı büyük harf';
-  else if ((text.match(/@/g) || []).length >= 5) reason = 'Toplu etiketleme';
-  else {
-    const k = (guild && guild.id) + ':' + who, now = Date.now(), t = (spam[k] = (spam[k] || []).filter(x => now - x < 5000));
-    t.push(now);
-    if (t.length >= 6) { reason = 'Spam'; spam[k] = []; }
-  }
-  if (!reason) return {};
-  return warnText(who, addWarn(g, who, reason + ' (otomatik)', 'AutoMod'), reason);
-}
-
-// ---------- HTTP sunucu ----------
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, X-Budd-App-Id',
-  'Access-Control-Allow-Private-Network': 'true',
-  'Access-Control-Max-Age': '86400'
-};
-const send = (res, code, obj) => { res.writeHead(code, Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, CORS)); res.end(obj == null ? '' : JSON.stringify(obj)); };
-
-http.createServer((req, res) => {
-  if (req.method === 'OPTIONS') return send(res, 204);
-  if (req.method !== 'POST') return send(res, 200, { ok: true, bot: 'modbot' });
-  let raw = '';
-  req.on('data', c => { raw += c; if (raw.length > 1e6) req.destroy(); });
-  req.on('end', () => {
-    let b; try { b = JSON.parse(raw); } catch (e) { return send(res, 400, { error: 'json' }); }
-    try {
-      if (b.type === 'ping') return send(res, 200, { type: 'ping' });
-      if (b.type === 'command') return send(res, 200, command(b));
-      if (b.type === 'message_create') return send(res, 200, automod(b));
-      send(res, 200, {});
-    } catch (e) { console.error(e); send(res, 200, priv(msg('⚠️ Bot hatası: ' + e.message))); }
+/* ---------- arama ---------- */
+function search(q) {
+  const target = ALLOWED.test(q) ? q : `ytsearch1:${q}`;
+  return new Promise((ok, no) => {
+    execFile(YTDLP, ['--no-playlist', '--no-warnings', '-j', '--skip-download', '--', target],
+      { maxBuffer: 20 << 20, timeout: 30000 }, (err, out) => {
+        if (err) return no(new Error('Şarkı bulunamadı'));
+        try {
+          const j = JSON.parse(out.trim().split('\n')[0]);
+          ok({ title: j.title, url: j.webpage_url || j.original_url, dur: j.duration || 0, by: j.uploader || '', thumb: j.thumbnail || '' });
+        } catch { no(new Error('Şarkı bulunamadı')); }
+      });
   });
-}).listen(PORT, () => console.log('Modbot hazır: http://localhost:' + PORT + '  (yetkililer: ' + (MODS.join(', ') || 'YOK — MODS ayarla') + ')'));
-      
+}
+
+/* ---------- oturumlar (her Budd bağlantısı bir oturum) ---------- */
+const sessions = new Map(); // ws -> S
+const tokens = new Map();   // token -> { S, track }
+
+function send(S, o) { if (S.ws.readyState === 1) S.ws.send(JSON.stringify(o)); }
+function say(S, replyTo, content, embed) {
+  send(S, { op: 'message', d: Object.assign({ reply_to: replyTo, content: content || '' }, embed ? { embeds: [embed] } : {}) });
+}
+function killStream(S) {
+  clearTimeout(S.timer); S.timer = null;
+  if (S.proc) { for (const p of S.proc) { try { p.kill('SIGKILL'); } catch {} } S.proc = null; }
+  if (S.token) { tokens.delete(S.token); S.token = null; }
+}
+function stopAll(S) { S.gen++; killStream(S); S.cur = null; send(S, { op: 'action', d: { act: 'stop' } }); }
+
+function playNext(S, replyTo) {
+  killStream(S);
+  if (S.loop && S.cur) S.q.unshift(S.cur);
+  S.cur = S.q.shift() || null;
+  S.gen++;
+  if (!S.cur) { send(S, { op: 'action', d: { act: 'stop' } }); return; }
+  const token = crypto.randomBytes(12).toString('hex');
+  S.token = token; tokens.set(token, { S, track: S.cur, gen: S.gen });
+  send(S, { op: 'action', d: { act: 'play', url: `${PUBLIC}/s/${token}.mp3`, v: S.vol } });
+  say(S, replyTo, '', {
+    title: '🎶 Çalıyor', description: `**${S.cur.title}**`, color: 0x5865f2,
+    thumbnail: S.cur.thumb ? { url: S.cur.thumb } : undefined,
+    fields: [{ name: 'Süre', value: fmt(S.cur.dur), inline: true }, { name: 'Ekleyen', value: S.cur.req, inline: true }],
+  });
+}
+// Şarkı bitince (süre + 2sn) sıradakine geç
+function armTimer(S, gen) {
+  clearTimeout(S.timer);
+  if (S.cur && S.cur.dur) S.timer = setTimeout(() => { if (S.gen === gen) playNext(S, null); }, (S.cur.dur + 2) * 1000);
+}
+
+/* ---------- komutlar ---------- */
+async function onCommand(S, id, name, opts, args, user) {
+  const r = (c, e) => say(S, id, c, e);
+  switch (name) {
+    case 'cal': {
+      const q = String(opts.sarki || (args || []).join(' ')).trim();
+      if (!q) return r('Kullanım: /cal <şarkı adı veya link>');
+      if (S.q.length >= MAXQ) return r('Sıra dolu.');
+      r('🔎 Aranıyor: ' + q.slice(0, 100));
+      let t;
+      try { t = await search(q); } catch (e) { return r('⛔ ' + e.message); }
+      t.req = user || 'biri';
+      send(S, { op: 'action', d: { act: 'join', ch: opts.oda || '' } }); // oda boşsa ilk ses kanalı
+      if (!S.cur) { S.q.push(t); playNext(S, id); }
+      else { S.q.push(t); r(`➕ Sıraya eklendi: **${t.title}** (${fmt(t.dur)})`); }
+      break;
+    }
+    case 'gec': if (!S.cur) return r('Çalan şarkı yok.'); r('⏭️ Geçildi.'); playNext(S, id); break;
+    case 'dur': stopAll(S); S.q = []; r('⏹️ Durduruldu ve sıra temizlendi.'); break;
+    case 'ses': {
+      const v = Math.max(1, Math.min(100, +opts.seviye || +(args || [])[0] || 50));
+      S.vol = v / 100; send(S, { op: 'action', d: { act: 'volume', v: S.vol } }); r(`🔊 Ses: %${v}`); break;
+    }
+    case 'dongu': S.loop = !S.loop; r(S.loop ? '🔁 Döngü açık.' : '➡️ Döngü kapalı.'); break;
+    case 'simdi': r(S.cur ? `🎶 **${S.cur.title}** (${fmt(S.cur.dur)}) – ${S.cur.by}` : 'Şu an bir şey çalmıyor.'); break;
+    case 'sira': {
+      const l = S.q.slice(0, 10).map((t, i) => `${i + 1}. ${t.title} (${fmt(t.dur)})`).join('\n');
+      r((S.cur ? `🎶 Şimdi: **${S.cur.title}**\n` : '') + (l || 'Sıra boş.')); break;
+    }
+    case 'cik': stopAll(S); S.q = []; send(S, { op: 'action', d: { act: 'leave' } }); r('👋 Çıkıldı.'); break;
+  }
+}
+
+/* ---------- HTTP: ses akışı ---------- */
+const server = http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+  const m = /^\/s\/([a-f0-9]{24})\.mp3$/.exec(req.url.split('?')[0]);
+  if (!m) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('budd muzik botu calisiyor'); }
+  const e = tokens.get(m[1]);
+  if (!e || e.S.gen !== e.gen) { res.writeHead(404); return res.end(); }
+  const S = e.S;
+  if (S.proc) for (const p of S.proc) { try { p.kill('SIGKILL'); } catch {} } // yeniden istek: baştan başlat
+  const y = spawn(YTDLP, ['-f', 'bestaudio/best', '--no-playlist', '--no-warnings', '-q', '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const f = spawn(FFMPEG, ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
+  S.proc = [y, f];
+  y.stdout.pipe(f.stdin); f.stdin.on('error', () => {}); y.on('error', () => {}); f.on('error', () => {});
+  res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
+  let first = true;
+  f.stdout.on('data', c => { if (first) { first = false; armTimer(S, e.gen); } res.write(c); });
+  f.on('close', () => { res.end(); if (!e.track.dur && S.gen === e.gen) setTimeout(() => { if (S.gen === e.gen) playNext(S, null); }, 1500); });
+  res.on('close', () => { try { y.kill('SIGKILL'); f.kill('SIGKILL'); } catch {} });
+});
+
+/* ---------- WebSocket gateway ---------- */
+const wss = new WebSocketServer({ server });
+wss.on('connection', ws => {
+  const S = { ws, q: [], cur: null, loop: false, vol: 0.6, gen: 0, timer: null, proc: null, token: null };
+  sessions.set(ws, S);
+  const ping = setInterval(() => send(S, { op: 'ping' }), 25000);
+  ws.on('message', raw => {
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    if (m.op === 'identify') return send(S, { op: 'ready' });
+    if (m.op !== 'interaction' || !m.d) return;
+    const d = m.d;
+    if (d.type === 'command' && d.data) {
+      onCommand(S, d.id, d.data.name, d.data.options || {}, d.data.args || [], d.user && d.user.username)
+        .catch(e => say(S, d.id, '⛔ ' + e.message));
+    }
+  });
+  ws.on('close', () => { clearInterval(ping); killStream(S); sessions.delete(ws); });
+});
+
+server.listen(PORT, () => console.log(`Budd müzik botu :${PORT}  (public: ${PUBLIC})`));
+process.on('unhandledRejection', e => console.error(e));
+    
