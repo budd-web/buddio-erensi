@@ -309,34 +309,42 @@ const server = http.createServer((req, res) => {
   const S = e.S;
   if (S.proc) for (const p of S.proc) { try { p.kill('SIGKILL'); } catch {} } // yeniden istek: baştan başlat
   const T0 = Date.now();
-  let errY = '', errF = '', bytes = 0, closed = false, ffOk = true;
-  // ffmpeg var mı? Yoksa ham ses (webm/opus) akıtılır; tarayıcılar bunu çalabilir.
-  const y = spawn(YTDLP, ['-f', ffOk && FFMPEG_OK ? 'bestaudio/best' : 'bestaudio[ext=webm]/bestaudio', '--no-playlist', '--no-warnings', '-q', ...YT_ARGS, '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'pipe'] });
-  y.stderr.on('data', d => { errY += d; if (errY.length > 600) errY = errY.slice(-600); });
-  y.on('error', er => { errY += 'yt-dlp başlatılamadı: ' + er.message; });
-  let out = y.stdout, f = null;
-  if (FFMPEG_OK) {
-    f = spawn(FFMPEG, ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
-    f.stderr.on('data', d => { errF += d; if (errF.length > 600) errF = errF.slice(-600); });
-    f.on('error', er => { errF += 'ffmpeg başlatılamadı: ' + er.message; });
-    y.stdout.pipe(f.stdin); f.stdin.on('error', () => {});
-    out = f.stdout;
-  }
-  y.stdout.on('error', () => {});
-  S.proc = f ? [y, f] : [y];
+  let bytes = 0, closed = false, attempt = 0;
   res.writeHead(200, { 'Content-Type': FFMPEG_OK ? 'audio/mpeg' : 'audio/webm', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
-  let first = true;
-  out.on('data', c => { bytes += c.length; if (first) { first = false; console.log('akış başladı', Date.now() - T0, 'ms'); armTimer(S, e.gen); } res.write(c); });
-  const done = () => {
-    if (closed) return; closed = true; res.end();
-    if (!bytes && S.gen === e.gen) {
-      const why = (errY + ' ' + errF).trim().split('\n').pop() || 'bilinmeyen hata';
-      console.error('akış boş döndü:', errY, errF);
-      say(S, null, '⛔ Ses akışı alınamadı: ' + cut(why, 180));
-    } else if (!e.track.dur && S.gen === e.gen) setTimeout(() => { if (S.gen === e.gen) playNext(S, null); }, 1500);
+  res.on('close', () => { closed = true; killStream2(); });
+  let cur = [];
+  const killStream2 = () => { for (const p of cur) { try { p.kill('SIGKILL'); } catch {} } };
+  // Önce eski (çalışan) yöntem: ek ayar yok. Ses gelmezse YT_ARGS ile tekrar dene.
+  const run = () => {
+    const extra = attempt === 0 ? [] : YT_ARGS;
+    let errY = '', errF = '', got = 0;
+    const y = spawn(YTDLP, ['-f', FFMPEG_OK ? 'bestaudio/best' : 'bestaudio[ext=webm]/bestaudio', '--no-playlist', '--no-warnings', '-q', ...extra, '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'pipe'] });
+    y.stderr.on('data', d => { errY = (errY + d).slice(-600); });
+    y.on('error', er => { errY += 'yt-dlp başlatılamadı: ' + er.message; });
+    y.stdout.on('error', () => {});
+    let out = y.stdout, f = null;
+    cur = [y];
+    if (FFMPEG_OK) {
+      f = spawn(FFMPEG, ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      f.stderr.on('data', d => { errF = (errF + d).slice(-600); });
+      f.on('error', er => { errF += 'ffmpeg başlatılamadı: ' + er.message; });
+      y.stdout.pipe(f.stdin); f.stdin.on('error', () => {});
+      out = f.stdout; cur = [y, f];
+    }
+    S.proc = cur;
+    out.on('data', c => { got += c.length; if (!bytes) { console.log('akış başladı', Date.now() - T0, 'ms'); armTimer(S, e.gen); } bytes += c.length; if (!closed) res.write(c); });
+    (f || y).on('close', () => {
+      if (closed || S.gen !== e.gen) return;
+      if (!got && attempt === 0) { console.error('1. deneme boş:', errY, errF); attempt = 1; return run(); }
+      closed = true; res.end();
+      if (!got) {
+        const why = (errY.trim().split('\n').pop() || errF.trim().split('\n').pop() || 'bilinmeyen hata');
+        console.error('akış boş döndü:', errY, errF);
+        say(S, null, '⛔ Ses akışı alınamadı (yt-dlp): ' + cut(why, 180));
+      } else if (!e.track.dur) setTimeout(() => { if (S.gen === e.gen) playNext(S, null); }, 1500);
+    });
   };
-  (f || y).on('close', done);
-  res.on('close', () => { try { y.kill('SIGKILL'); if (f) f.kill('SIGKILL'); } catch {} });
+  run();
 });
 
 /* ---------- WebSocket gateway ---------- */
@@ -365,3 +373,4 @@ wss.on('connection', ws => {
 
 server.listen(PORT, () => console.log(`Budd müzik botu :${PORT}  (public: ${PUBLIC})`));
 process.on('unhandledRejection', e => console.error(e));
+                                                       
