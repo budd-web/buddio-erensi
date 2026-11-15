@@ -18,9 +18,23 @@ const { spawn, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 
 const PORT = +process.env.PORT || 8080;
-const PUBLIC = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
-const YTDLP = process.env.YTDLP || 'yt-dlp';
-const FFMPEG = process.env.FFMPEG || 'ffmpeg';
+const PUBLIC = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
+const fs = require('fs'), os = require('os'), path = require('path');
+let YTDLP = process.env.YTDLP || 'yt-dlp';
+let FFMPEG = process.env.FFMPEG || (() => { try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; } })();
+// yt-dlp yoksa (ör. Render) açılışta indir
+async function ensureYtdlp() {
+  if (process.env.YTDLP) return;
+  const p = path.join(os.tmpdir(), 'yt-dlp');
+  try { if (fs.existsSync(p)) { YTDLP = p; return; } } catch {}
+  try {
+    const r = await fetch('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    fs.writeFileSync(p, Buffer.from(await r.arrayBuffer()), { mode: 0o755 });
+    YTDLP = p; console.log('yt-dlp indirildi');
+  } catch (e) { console.error('yt-dlp indirilemedi:', e.message); }
+}
+ensureYtdlp();
 const MAXQ = 50;
 
 const fmt = s => { s = Math.floor(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
@@ -153,4 +167,4 @@ wss.on('connection', ws => {
 
 server.listen(PORT, () => console.log(`Budd müzik botu :${PORT}  (public: ${PUBLIC})`));
 process.on('unhandledRejection', e => console.error(e));
-    
+        
