@@ -54,11 +54,13 @@ const SHOW = 5; // arama sonucu sayısı
 const fmt = s => { s = Math.floor(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 const fmtP = s => { s = Math.floor(s || 0); if (!s) return '--:--'; return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
 const cut = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
-const ALLOWED = /^https?:\/\/([\w-]+\.)?(soundcloud\.com|snd\.sc)\//i;
-const SRC = { sc: { name: 'SoundCloud', pre: 'scsearch' } };
+const ALLOWED = /^https?:\/\/([\w-]+\.)?(youtube\.com|youtu\.be|music\.youtube\.com|soundcloud\.com|snd\.sc)\//i;
+const SRC = { yt: { name: 'YouTube', pre: 'ytsearch' }, sc: { name: 'SoundCloud', pre: 'scsearch' } };
 
 /* ---------- yt-dlp ---------- */
-const YT_ARGS = [];
+// Kalıcı önbellek: yt-dlp her çalıştığında SoundCloud/YouTube ayarlarını baştan indirmesin (en büyük yavaşlık buydu)
+const CACHE = path.join(os.tmpdir(), 'ytdlp-cache');
+const YT_ARGS = ['--cache-dir', CACHE, '--socket-timeout', '10'];
 function runYtdlp(args, timeout = 40000) {
   return new Promise((ok, no) => {
     execFile(YTDLP, args, { maxBuffer: 30 << 20, timeout }, (err, out, errout) => {
@@ -93,7 +95,18 @@ async function searchList(src, q) {
   if (!list.length) throw new Error('sonuç yok');
   return list.slice(0, SHOW);
 }
-async function smartSearch(q) { return { src: 'sc', items: await searchList('sc', q) }; }
+// İki kaynağı AYNI ANDA ara, ilk cevap veren kazanır (hangisi hızlıysa o)
+function smartSearch(q) {
+  return new Promise((ok, no) => {
+    let left = 2, last; const done = new Set();
+    for (const src of ['yt', 'sc']) {
+      searchList(src, q).then(items => { if (!done.size) { done.add(src); ok({ src, items }); } },
+        e => { last = e; if (--left === 0 && !done.size) no(new Error('Şarkı bulunamadı (' + ((last && last.message) || '?') + ')')); });
+    }
+  });
+}
+// Açılışta yt-dlp'yi ısıt: önbellek hazır olsun, ilk arama yavaş kalmasın
+setTimeout(() => { for (const src of ['sc', 'yt']) runYtdlp(['--no-warnings', '--flat-playlist', '-j', '--skip-download', ...YT_ARGS, '--', `${SRC[src].pre}1:a`], 30000).catch(() => {}); }, 3000);
 
 /* ---------- oturumlar (her Budd bağlantısı bir oturum) ---------- */
 const sessions = new Map(); // ws -> S
@@ -228,7 +241,7 @@ function pickerMsg(S, sid) {
     embeds: [{
       description: `${SRC[s.src].name} sonuçları gösteriliyor. Aşağıdaki butonlardan bir şarkı seç.\n\n${lines}`,
       color: 0x2ec4b6,
-      footer: { text: 'Kaynak: SoundCloud' },
+      footer: { text: 'Kaynak: ' + SRC[s.src].name },
     }],
     components: [
       { type: 1, components: nums },
@@ -339,8 +352,8 @@ function startLive(S, e) {
   S.clients = S.clients || new Set();
   if (!FFMPEG_OK) { say(S, null, '⛔ Sunucu modu için sunucuda ffmpeg gerekli (npm i ffmpeg-static).'); return; }
   let bytes = 0, errY = '', errF = '';
-  const y = spawn(YTDLP, ['-f', 'bestaudio/best', '--no-playlist', '--no-warnings', '-q', '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'pipe'] });
-  const f = spawn(FFMPEG, ['-loglevel', 'error', '-re', '-fflags', 'nobuffer', '-probesize', '32768', '-analyzeduration', '0', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-flush_packets', '1', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const y = spawn(YTDLP, ['-f', 'bestaudio/best', '--no-playlist', '--no-warnings', '-q', ...YT_ARGS, '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const f = spawn(FFMPEG, ['-loglevel', 'error', '-re', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-ar', '44100', '-ac', '2', '-b:a', '192k', '-flush_packets', '1', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
   y.stderr.on('data', d => { errY = (errY + d).slice(-600); }); f.stderr.on('data', d => { errF = (errF + d).slice(-600); });
   y.on('error', er => { errY += 'yt-dlp başlatılamadı: ' + er.message; }); f.on('error', er => { errF += 'ffmpeg başlatılamadı: ' + er.message; });
   y.stdout.on('error', () => {}); f.stdin.on('error', () => {}); y.stdout.pipe(f.stdin);
@@ -363,18 +376,4 @@ function startLive(S, e) {
 /* ---------- HTTP: ses akışı ---------- */
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
-  const m = /^\/s\/([a-f0-9]{24})\.mp3$/.exec(req.url.split('?')[0]);
-  if (!m) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('budd muzik botu calisiyor'); }
-  const e = tokens.get(m[1]);
-  if (!e || e.S.gen !== e.gen) { res.writeHead(404); return res.end(); }
-  const S = e.S;
-  if (S.srv) { // ortak canlı yayına katıl
-    res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
-    S.clients = S.clients || new Set(); S.clients.add(res); res.on('close', () => S.clients.delete(res)); return;
-  }
-  if (S.proc) for (const p of S.proc) { try { p.kill('SIGKILL'); } catch {} } // yeniden istek: baştan başlat
-  const T0 = Date.now();
-  let bytes = 0, closed = false, attempt = 0;
-  res.writeHead(200, { 'Content-Type': FFMPEG_OK ? 'audio/mpeg'
+  res.setHeade
