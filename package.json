@@ -1,17 +1,13 @@
 {
   "name": "budd-akinator-bot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
-    "aki-api": "^6.0.0",
+    "akinator-client": "latest",
     "cors": "^2.8.5",
     "express": "^4.19.2"
   }
