@@ -1,528 +1,170 @@
-/**
- * Budd.io Müzik Botu (tek dosya, Node 18+)
- *
- * Nasıl çalışır: Budd, Gateway URL'ine WebSocket ile bağlanır. Komutu yazan kişiye
- * bot "ses odasına gir" ve "şu URL'yi çal" eylemlerini yollar. Bu dosya aynı portta
- * hem WebSocket gateway'i hem de şarkıyı yt-dlp + ffmpeg ile mp3 akışına çeviren
- * HTTP ucunu sunar. Tam şarkı çalar (YouTube / SoundCloud), isimle arar.
- *
- * YENİ:
- *  - /cal <şarkı adı> yazınca ilk 5 sonuç liste olarak çıkar, 1-5 butonlarından birini seçersin.
- *    "YouTube'da ara" / "SoundCloud'da ara" butonlarıyla kaynak değiştirilir. (Sadece sen görürsün.)
- *    Link yapıştırırsan liste çıkmaz, direkt çalar.
- *  - Bot sesli odaya girince adı ve profiliyle odada görünür, kendini otomatik sessize + sağırlaştırır.
- *  - /duraklat, /duraklat off (ya da /devam) ile duraklatma. "Çalıyor" mesajında kontrol butonları var.
- *
- * Gereksinim:  npm i ws        +  sistemde  yt-dlp  ve  ffmpeg
- * Çalıştır:    PUBLIC_URL=https://botun.alanadin.com node budd-muzik-bot.js
- *   (PUBLIC_URL, bu sunucuya HTTPS ile dışarıdan erişilen adres olmalı; Budd https
- *    olduğu için http://ip:port çalışmaz. Cloudflare Tunnel / Caddy / nginx kullan.)
- * Budd Portal > Genel Bilgi > Gateway URL:  wss://botun.alanadin.com
- *
- * Komutlar (Portal > Komutlar'a eklersen / yazınca öneri çıkar; eklemesen de çalışır):
- *   cal [sarki]  gec  dur  duraklat [on|off]  devam  ses [1-100]  dongu  simdi  sira  cik
- */
-const http = require('http');
-const crypto = require('crypto');
-const { spawn, execFile } = require('child_process');
-const { WebSocketServer } = require('ws');
+// Budd · Akinator botu (HTTP Endpoint yöntemi)
+// Kurulum:  npm i express cors aki-api   ·   package.json içine  "type": "module"  ekle
+// Çalıştır: node index.js
+// Ortam değişkenleri (hepsi isteğe bağlı):
+//   PORT=3000            dinlenecek port
+//   BOT_PATH=/           endpoint yolu (gizli bir yol kullan: /budd-x7k2p9)
+//   APP_ID=...           doluysa X-Budd-App-Id başlığı kontrol edilir
+//   AKI_REGION=tr        akinator dili (tr, en, de, fr, es, ...)
 
-const PORT = +process.env.PORT || 8080;
-const PUBLIC = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
-const fs = require('fs'), os = require('os'), path = require('path');
-let YTDLP = process.env.YTDLP || 'yt-dlp';
-let FFMPEG = process.env.FFMPEG || (() => { try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; } })();
-// yt-dlp yoksa (ör. Render) açılışta indir
-async function ensureYtdlp() {
-  if (process.env.YTDLP) return;
-  const p = path.join(os.tmpdir(), 'yt-dlp');
-  try { if (fs.existsSync(p)) { YTDLP = p; return; } } catch {}
-  try {
-    const r = await fetch('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    fs.writeFileSync(p, Buffer.from(await r.arrayBuffer()), { mode: 0o755 });
-    YTDLP = p; console.log('yt-dlp indirildi');
-  } catch (e) { console.error('yt-dlp indirilemedi:', e.message); }
-}
-ensureYtdlp();
-let FFMPEG_OK = true;
-(function () { try { const r = require('child_process').spawnSync(FFMPEG, ['-version']); FFMPEG_OK = r.status === 0; } catch { FFMPEG_OK = false; }
-  console.log(FFMPEG_OK ? 'ffmpeg bulundu' : 'UYARI: ffmpeg yok -> ham webm akıtılacak (npm i ffmpeg-static önerilir)'); })();
-const MAXQ = 50;
-const SHOW = 5; // arama sonucu sayısı
+import express from "express";
+import cors from "cors";
+import { Aki } from "aki-api";
 
-const fmt = s => { s = Math.floor(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
-const fmtP = s => { s = Math.floor(s || 0); if (!s) return '--:--'; return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
-const cut = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
-const ALLOWED = /^https?:\/\/([\w-]+\.)?(youtube\.com|youtu\.be|music\.youtube\.com|soundcloud\.com|snd\.sc|api(-v2)?\.soundcloud\.com)\//i;
-const SRC = { au: { name: 'Audius' }, yt: { name: 'YouTube', pre: 'ytsearch' }, sc: { name: 'SoundCloud', pre: 'scsearch' } };
+const PORT = Number(process.env.PORT) || 3000;
+const BOT_PATH = process.env.BOT_PATH || "/";
+const APP_ID = process.env.APP_ID || "";
+const REGION = process.env.AKI_REGION || "tr";
+const TTL = 15 * 60 * 1000;   // 15 dk işlem yapılmayan oyun silinir
+const GUESS_AT = 85;          // ilerleme % bu değere gelince tahmin eder
+const MAX_STEP = 78;          // bu soruda zorunlu tahmin
+const COLOR = 5793266;
 
-/* ---------- yt-dlp ---------- */
-// Kalıcı önbellek: yt-dlp her çalıştığında SoundCloud/YouTube ayarlarını baştan indirmesin (en büyük yavaşlık buydu)
-const CACHE = path.join(os.tmpdir(), 'ytdlp-cache');
-const YT_ARGS = ['--cache-dir', CACHE, '--socket-timeout', '10'];
-function runYtdlp(args, timeout = 40000) {
-  return new Promise((ok, no) => {
-    execFile(YTDLP, args, { maxBuffer: 30 << 20, timeout }, (err, out, errout) => {
-      if (err) {
-        const msg = String(errout || err.message).trim().split('\n').pop().slice(0, 200);
-        console.error('yt-dlp hata:', msg);
-        return no(new Error(msg));
-      }
-      ok(String(out));
-    });
-  });
-}
-const toTrack = j => ({
-  title: j.title || 'Adsız',
-  url: j.webpage_url || j.permalink_url || j.original_url || (/^https?:/i.test(j.url || '') ? j.url : (j.id && j.ie_key === 'Youtube' ? 'https://www.youtube.com/watch?v=' + j.id : '')),
-  dur: j.duration || 0,
-  by: j.uploader || j.channel || '',
-  thumb: j.thumbnail || (Array.isArray(j.thumbnails) && j.thumbnails.length ? j.thumbnails[j.thumbnails.length - 1].url : '') || '',
-});
-// Tek şarkının tam bilgisi (link verilince ya da süre/kapak eksikse)
-async function ytdlpJson(target) {
-  const out = await runYtdlp(['--no-playlist', '--no-warnings', '-j', '--skip-download', ...YT_ARGS, '--', target]);
-  try { return toTrack(JSON.parse(out.trim().split('\n')[0])); } catch { throw new Error('Çözümlenemedi'); }
-}
-// Arama listesi (ilk SHOW sonuç)
-async function searchList(src, q) {
-  const out = await runYtdlp(['--no-warnings', '--flat-playlist', '-j', '--skip-download', ...YT_ARGS, '--', `${SRC[src].pre}${SHOW}:${q}`]);
-  const list = [];
-  for (const line of out.trim().split('\n')) {
-    try { const t = toTrack(JSON.parse(line)); if (t.url && ALLOWED.test(t.url)) list.push(t); } catch {}
-  }
-  if (!list.length) throw new Error('sonuç yok');
-  return list.slice(0, SHOW);
-}
-// İki kaynağı AYNI ANDA ara, ilk cevap veren kazanır (hangisi hızlıysa o)
-async function smartSearch(q) {
-  try { return { src: 'au', items: await searchAudius(q) }; } catch (e) { console.error('Audius:', e.message); }
-  return ytSearch(q);
-}
-function ytSearch(q) {
-  return new Promise((ok, no) => {
-    let left = 2, last; const done = new Set();
-    for (const src of ['yt', 'sc']) {
-      searchList(src, q).then(items => { if (!done.size) { done.add(src); ok({ src, items }); } },
-        e => { last = e; if (--left === 0 && !done.size) no(new Error('Şarkı bulunamadı (' + ((last && last.message) || '?') + ')')); });
-    }
-  });
-}
-// Açılışta yt-dlp'yi ısıt: önbellek hazır olsun, ilk arama yavaş kalmasın
-setTimeout(() => { for (const src of ['sc', 'yt']) runYtdlp(['--no-warnings', '--flat-playlist', '-j', '--skip-download', ...YT_ARGS, '--', `${SRC[src].pre}1:a`], 30000).catch(() => {}); }, 3000);
+/** oyunlar: guild:channel:user -> oturum */
+const games = new Map();
+const key = (b) => `${b.guild?.id || "dm"}:${b.channel?.id || "-"}:${b.user.id}`;
 
-/* ---------- Audius: yt-dlp'siz, doğrudan mp3 akışı (arama ~0,3 sn, çalma ~0,5 sn) ---------- */
-const AU_APP = 'BuddBot', AU_API = process.env.AUDIUS_API || 'https://api.audius.co';
-let auHost = null, auHostAt = 0;
-async function fetchT(url, ms, opt) { const ac = new AbortController(); const t = setTimeout(() => ac.abort(), ms); try { return await fetch(url, Object.assign({ signal: ac.signal }, opt || {})); } finally { clearTimeout(t); } }
-async function auGetHost() {
-  if (auHost && Date.now() - auHostAt < 600000) return auHost;
-  try { const r = await fetchT(AU_API, 3000); const j = await r.json(); const h = j && j.data && j.data[Math.floor(Math.random() * j.data.length)]; if (h) { auHost = h.replace(/\/+$/, ''); auHostAt = Date.now(); return auHost; } } catch {}
-  return auHost || AU_API;
-}
-async function searchAudius(q) {
-  const H = await auGetHost();
-  const r = await fetchT(`${H}/v1/tracks/search?query=${encodeURIComponent(q)}&limit=${SHOW * 2}&app_name=${AU_APP}`, 4000);
-  if (!r.ok) { auHost = null; throw new Error('Audius HTTP ' + r.status); }
-  const j = await r.json();
-  const list = (j.data || []).filter(t => t && t.id && t.is_streamable !== false).slice(0, SHOW).map(t => ({
-    title: t.title || 'Adsız', url: 'https://audius.co/' + (t.permalink || '').replace(/^\//, ''), dur: t.duration || 0, by: (t.user && t.user.name) || '',
-    thumb: (t.artwork && (t.artwork['150x150'] || t.artwork['480x480'])) || '', direct: `${H}/v1/tracks/${t.id}/stream?app_name=${AU_APP}`,
-  }));
-  if (!list.length) throw new Error('sonuç yok');
-  return list;
-}
-/* Doğrudan (yt-dlp'siz) kaynağı ffmpeg ile mp3'e çevir */
-function spawnDirect(track, re) {
-  const o = { errF: '' };
-  const a = ['-loglevel', 'error'];
-  if (re) a.push('-re');
-  a.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2', '-i', track.direct, '-vn', '-c:a', 'libmp3lame', '-ar', '44100', '-ac', '2', '-b:a', '192k', '-flush_packets', '1', '-f', 'mp3', 'pipe:1');
-  o.f = spawn(FFMPEG, a, { stdio: ['ignore', 'pipe', 'pipe'] });
-  o.f.stderr.on('data', d => { o.errF = (o.errF + d).slice(-600); });
-  o.f.on('error', er => { o.errF += 'ffmpeg başlatılamadı: ' + er.message; });
-  return o;
-}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, g] of games) if (now - g.t > TTL) games.delete(k);
+}, 60 * 1000).unref();
 
-/* ---------- oturumlar (her Budd bağlantısı bir oturum) ---------- */
-const sessions = new Map(); // ws -> S
-const guilds = new Map();   // sunucu(guild) id -> S  (sunucu modunda oturum, Budd sekmesi kapansa da yaşar)
-const tokens = new Map();   // token -> { S, track, gen }
+// ---------- görünümler ----------
+const btn = (label, id, style) => ({ type: 2, style, label, custom_id: id });
+const row = (...c) => ({ type: 1, components: c });
 
-function send(S, o) { if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(o)); }
-
-/* ---------- SUNUCU MODU: bot sesli odaya gerçek üye gibi girer ----------
- * Budd, her komutla Firebase adresini ve sunucu bilgisini yollar. Bot burada:
- *  - Firebase'e "bot_<id>" üyesi olarak yazılır (ad, profil, durum) ve her 15 sn tazelenir,
- *  - şarkıyı BİR kez çözüp herkese ortak canlı mp3 yayını yapar, adresini /bplay'e yazar,
- *  - odadaki herkes bu yayını dinler; kimse olmasa da şarkılar sırayla akmaya devam eder,
- *  - komutu veren kişi odadan çıksa, Budd sekmesini kapatsa da bot çalmayı sürdürür. */
-const okFb = u => process.env.ALLOW_ANY_FB === '1' || /^https:\/\/[\w.-]+\.(firebaseio\.com|firebasedatabase\.app)\/?$/i.test(String(u || ''));
-function fbw(S, p, method, body) {
-  if (!S.fb || !S.gid) return;
-  fetch(`${S.fb}/budd/${encodeURIComponent(S.gid)}${p}.json`, { method, body: body === undefined ? undefined : JSON.stringify(body) }).catch(() => {});
-}
-function pickCh(S) {
-  const v = (S.chans || []).filter(c => c.type === 'voice');
-  const want = String(S.oda || '').replace(/^#/, '').toLowerCase();
-  return (want && (v.find(c => c.id === S.oda || String(c.name).toLowerCase() === want) || {}).id)
-    || (v.find(c => c.id === S.uvc) || {}).id || (v[0] || {}).id || '';
-}
-function presence(S) {
-  if (!S.ch || !S.joined) return;
-  const b = S.bot || {};
-  fbw(S, `/voice/${S.ch}/bot_${b.id}`, 'PUT', { n: cut(b.name || 'Bot', 32), ts: Date.now(), bot: 1, mu: S.cur && !S.pa ? 0 : 1, c: b.color || '', im: b.img || '' });
-}
-function bplayPut(S) {
-  if (!S.ch || !S.play) return;
-  fbw(S, `/bplay/${S.ch}`, 'PUT', { url: S.play.url, v: S.vol, ts: S.play.ts, by: cut((S.bot || {}).name, 20), bid: (S.bot || {}).id, live: 1, pa: S.pa ? Date.now() : 0 });
-}
-function srvJoin(S) {
-  const ch = pickCh(S);
-  if (!ch) return false;
-  if (S.joined && S.ch && S.ch !== ch) srvLeave(S, true);
-  S.ch = ch; S.joined = true;
-  presence(S);
-  if (!S.hb) S.hb = setInterval(() => { presence(S); bplayPut(S); }, 15000);
-  return true;
-}
-function srvLeave(S, keepSession) {
-  if (S.ch) { fbw(S, `/bplay/${S.ch}`, 'DELETE'); fbw(S, `/voice/${S.ch}/bot_${(S.bot || {}).id}`, 'DELETE'); }
-  clearInterval(S.hb); S.hb = null; S.joined = false; S.play = null; S.pa = false;
-  if (!keepSession) S.ch = '';
-}
-function sigProc(S, sig) { if (S.proc) for (const p of S.proc) { try { p.kill(sig); } catch {} } }
-function endClients(S) { if (S.clients) { for (const r of S.clients) { try { r.end(); } catch {} } S.clients.clear(); } }
-// Eylemler: sunucu modunda Firebase'e, eski modda Budd'a (tarayıcıda çalan) gider
-function act(S, d) {
-  if (!S.srv) return send(S, { op: 'action', d });
-  switch (d.act) {
-    case 'join': srvJoin(S); break;
-    case 'stop': S.play = null; S.pa = false; if (S.ch) fbw(S, `/bplay/${S.ch}`, 'DELETE'); presence(S); if (!S.ws && !S.q.length) { clearTimeout(S.idle); S.idle = setTimeout(() => { if (!S.ws && !S.cur && !S.q.length) { srvLeave(S); guilds.delete(S.gid); } }, 600000); } break;
-    case 'leave': srvLeave(S); break;
-    case 'pause': sigProc(S, 'SIGSTOP'); presence(S); bplayPut(S); break;
-    case 'resume': sigProc(S, 'SIGCONT'); presence(S); bplayPut(S); break;
-    case 'volume': bplayPut(S); break;
-  }
-}
-function say(S, replyTo, content, embed, extra) {
-  send(S, { op: 'message', d: Object.assign({ reply_to: replyTo, content: content || '' }, embed ? { embeds: [embed] } : {}, extra || {}) });
-}
-function killStream(S) {
-  clearTimeout(S.timer); S.timer = null; endClients(S);
-  if (S.proc) { for (const p of S.proc) { try { p.kill('SIGKILL'); } catch {} } S.proc = null; }
-  if (S.token) { tokens.delete(S.token); S.token = null; }
-}
-function stopAll(S) { S.gen++; S.paused = false; killStream(S); S.cur = null; act(S, { act: 'stop' }); }
-
-// "Çalıyor" mesajının altındaki kontrol butonları
-const CTL = [{ type: 1, components: [
-  { type: 2, style: 1, label: 'Duraklat', emoji: '⏸', custom_id: 'ctl:pause' },
-  { type: 2, style: 1, label: 'Geç', emoji: '⏭', custom_id: 'ctl:skip' },
-  { type: 2, style: 1, label: 'Durdur', emoji: '⏹', custom_id: 'ctl:stop' },
-  { type: 2, style: 1, label: 'Döngü', emoji: '🔁', custom_id: 'ctl:loop' },
-] }];
-
-function playNext(S, replyTo) {
-  killStream(S);
-  if (S.loop && S.cur) S.q.unshift(S.cur);
-  S.cur = S.q.shift() || null;
-  S.gen++; S.paused = false; S.pa = false; S.left = null;
-  if (!S.cur) { act(S, { act: 'stop' }); return; }
-  const token = crypto.randomBytes(12).toString('hex');
-  S.token = token; const ent = { S, track: S.cur, gen: S.gen }; tokens.set(token, ent);
-  if (S.srv) {
-    S.play = { url: `${PUBLIC}/s/${token}.mp3`, ts: Date.now() };
-    startLive(S, ent); bplayPut(S); presence(S);
-  } else send(S, { op: 'action', d: { act: 'play', url: `${PUBLIC}/s/${token}.mp3`, v: S.vol } });
-  say(S, replyTo, '', {
-    title: '🎶 Çalıyor', description: `**${S.cur.title}**`, color: 0x5865f2,
-    thumbnail: S.cur.thumb ? { url: S.cur.thumb } : undefined,
-    fields: [{ name: 'Süre', value: fmt(S.cur.dur), inline: true }, { name: 'Ekleyen', value: S.cur.req, inline: true }],
-  }, { components: CTL });
-}
-// Şarkı bitince (süre + 2sn) sıradakine geç. Duraklatılırsa kalan süre saklanır.
-function armTimer(S, gen) {
-  clearTimeout(S.timer);
-  if (!(S.cur && S.cur.dur)) return;
-  S.left = (S.cur.dur + 2) * 1000; S.t0 = Date.now();
-  if (S.paused) return;
-  S.timer = setTimeout(() => { if (S.gen === gen) playNext(S, null); }, S.left);
-}
-function pauseOn(S) {
-  if (S.paused) return false;
-  S.paused = true; S.pa = true;
-  if (S.timer) { clearTimeout(S.timer); S.timer = null; S.left = Math.max(0, S.left - (Date.now() - S.t0)); }
-  act(S, { act: 'pause' });
-  return true;
-}
-function pauseOff(S) {
-  if (!S.paused) return false;
-  S.paused = false; S.pa = false;
-  if (S.left != null && S.cur && S.cur.dur) {
-    const gen = S.gen; S.t0 = Date.now();
-    S.timer = setTimeout(() => { if (S.gen === gen) playNext(S, null); }, S.left);
-  }
-  act(S, { act: 'resume' });
-  return true;
-}
-
-/* ---------- arama sonucu mesajı (butonlu liste) ---------- */
-function pickerMsg(S, sid) {
-  const s = S.searches.get(sid);
-  const lines = s.items.map((t, i) => `${i + 1}. ${cut(t.title, 70)} (${fmtP(t.dur)})`).join('\n');
-  const nums = s.items.map((_, i) => ({ type: 2, style: 1, label: String(i + 1), custom_id: `pick:${sid}:${i}` }));
+function questionView(g) {
+  const a = g.aki;
+  const id = (x) => `aki:${g.owner}:${x}`;
   return {
-    id: 's_' + sid, flags: 64,
     embeds: [{
-      description: `${SRC[s.src].name} sonuçları gösteriliyor. Aşağıdaki butonlardan bir şarkı seç.\n\n${lines}`,
-      color: 0x2ec4b6,
-      footer: { text: 'Kaynak: ' + SRC[s.src].name },
+      title: "🧞 Akinator",
+      description: `**Soru ${a.currentStep + 1}**\n${a.question}`,
+      color: COLOR,
+      footer: { text: `İlerleme %${Math.round(a.progress)} · Oyuncu: ${g.name}` },
     }],
     components: [
-      { type: 1, components: nums },
+      row(btn("Evet", id("a0"), 3), btn("Hayır", id("a1"), 4), btn("Bilmiyorum", id("a2"), 2)),
+      row(btn("Muhtemelen", id("a3"), 1), btn("Muhtemelen değil", id("a4"), 1)),
+      row(btn("↩ Geri", id("back"), 2), btn("Bitir", id("stop"), 2)),
     ],
   };
 }
-function rememberSearch(S, s) {
-  const sid = crypto.randomBytes(4).toString('hex');
-  S.searches.set(sid, s);
-  while (S.searches.size > 20) S.searches.delete(S.searches.keys().next().value);
-  return sid;
-}
 
-/* ---------- şarkıyı sıraya ekle / çal ---------- */
-async function addTrack(S, replyTo, track, user, chName) {
-  if (S.q.length >= MAXQ) return say(S, replyTo, 'Sıra dolu.');
-  if (!track.direct && !ALLOWED.test(track.url || '')) return say(S, replyTo, '⛔ Bu bağlantı desteklenmiyor.');
-  // süre/kapak eksikse tam bilgiyi çek
-  track.req = user || 'biri';
-  // Bot sesli odaya girer: adı + profiliyle görünür, kendini sessize alır, sağırlaştırır (oda boşsa ilk ses kanalı)
-  S.oda = chName || S.oda; act(S, { act: 'join', ch: chName || '', mute: true, deaf: true });
-  S.q.push(track);
-  if (!S.cur) playNext(S, replyTo);
-  else say(S, replyTo, `➕ Sıraya eklendi: **${track.title}** (${fmt(track.dur)})`);
-}
-
-/* ---------- komutlar ---------- */
-async function onCommand(S, id, name, opts, args, user) {
-  const r = (c, e) => say(S, id, c, e);
-  switch (name) {
-    case 'cal': {
-      const q = String(opts.sarki || (args || []).join(' ')).trim();
-      if (!q) return r('Kullanım: /cal <şarkı adı veya link>');
-      if (S.q.length >= MAXQ) return r('Sıra dolu.');
-      S.oda = opts.oda || '';
-      // Link verildiyse liste göstermeden direkt çal
-      if (ALLOWED.test(q)) {
-        const t = { title: q.replace(/^https?:\/\/(www\.)?/i, '').slice(0, 80), url: q, dur: 0, by: '', thumb: '' };
-        return addTrack(S, id, t, user, S.oda);
-      }
-      // Aksi halde butonlu sonuç listesi (sadece komutu yazan görür)
-      const tmp = crypto.randomBytes(4).toString('hex');
-      say(S, id, '🔎 Aranıyor: ' + cut(q, 100), null, { id: 's_' + tmp, flags: 64 });
-      let res;
-      try { res = await smartSearch(q); } catch (e) { return say(S, id, '⛔ ' + e.message, null, { edit: 's_' + tmp, flags: 64 }); }
-      const sid = rememberSearch(S, { q, src: res.src, items: res.items, auto: true, user: user || '' });
-      const m = pickerMsg(S, sid);
-      m.edit = 's_' + tmp; delete m.id; // "Aranıyor" mesajını listeye çevir
-      send(S, { op: 'message', d: Object.assign({ reply_to: id, content: '' }, m) });
-      // Buton tıklamaları mesaj kimliğiyle gelir; listeyi doğru bulmak için kimliği eşle
-      S.searches.get(sid).mid = 's_' + tmp;
-      break;
-    }
-    case 'gec': if (!S.cur) return r('Çalan şarkı yok.'); r('⏭️ Geçildi.'); playNext(S, id); break;
-    case 'dur': stopAll(S); S.q = []; r('⏹️ Durduruldu ve sıra temizlendi.'); break;
-    case 'duraklat': {
-      const a = String((opts.durum || (args || [])[0] || 'on')).toLowerCase();
-      if (!S.cur) return r('Çalan şarkı yok.');
-      if (a === 'off' || a === 'kapat' || a === 'devam') return r(pauseOff(S) ? '▶️ Devam ediyor.' : 'Oynatıcı zaten duraklatılmamış.');
-      return r(pauseOn(S) ? 'Oynatıcı duraklatıldı. `/duraklat off` komutuyla devam ettirebilirsin.' : 'Oynatıcı zaten duraklatılmış.');
-    }
-    case 'devam': if (!S.cur) return r('Çalan şarkı yok.'); r(pauseOff(S) ? '▶️ Devam ediyor.' : 'Oynatıcı zaten duraklatılmamış.'); break;
-    case 'ses': {
-      const v = Math.max(1, Math.min(100, +opts.seviye || +(args || [])[0] || 50));
-      S.vol = v / 100; act(S, { act: 'volume', v: S.vol }); r(`🔊 Ses: %${v}`); break;
-    }
-    case 'dongu': S.loop = !S.loop; r(S.loop ? '🔁 Döngü açık.' : '➡️ Döngü kapalı.'); break;
-    case 'simdi': r(S.cur ? `🎶 **${S.cur.title}** (${fmt(S.cur.dur)}) – ${S.cur.by}` : 'Şu an bir şey çalmıyor.'); break;
-    case 'sira': {
-      const l = S.q.slice(0, 10).map((t, i) => `${i + 1}. ${t.title} (${fmt(t.dur)})`).join('\n');
-      r((S.cur ? `🎶 Şimdi: **${S.cur.title}**\n` : '') + (l || 'Sıra boş.')); break;
-    }
-    case 'cik': stopAll(S); S.q = []; act(S, { act: 'leave' }); r('👋 Çıkıldı.'); break;
-  }
-}
-
-/* ---------- buton tıklamaları ---------- */
-async function onComponent(S, id, data, user) {
-  const cid = String(data.custom_id || '');
-  const [kind, a, b] = cid.split(':');
-  // Çalıyor mesajındaki kontrol butonları
-  if (kind === 'ctl') {
-    if (a === 'pause') {
-      if (!S.cur) return say(S, id, 'Çalan şarkı yok.', null, { flags: 64 });
-      return say(S, id, pauseOn(S) ? '⏸️ Duraklatıldı.' : (pauseOff(S) ? '▶️ Devam ediyor.' : ''));
-    }
-    if (a === 'skip') return onCommand(S, id, 'gec', {}, [], user);
-    if (a === 'stop') return onCommand(S, id, 'dur', {}, [], user);
-    if (a === 'loop') return onCommand(S, id, 'dongu', {}, [], user);
-    return;
-  }
-  const s = S.searches.get(a);
-  const mid = data.message_id || (s && s.mid) || ('s_' + a);
-  if (!s) return say(S, id, 'Bu arama süresi doldu, /cal ile tekrar ara.', null, { flags: 64 });
-  const edit = (extra) => send(S, { op: 'message', d: Object.assign({ reply_to: id, content: '', edit: mid, flags: 64 }, extra) });
-  // Şarkı seç
-  if (kind === 'pick') {
-    const t = s.items[+b];
-    if (!t) return;
-    edit({ content: '✅ Seçildi: **' + cut(t.title, 80) + '**', embeds: [], components: [] });
-    S.searches.delete(a);
-    return addTrack(S, id, Object.assign({}, t), user, S.oda);
-  }
-}
-
-/* ---------- sunucu modu: ortak canlı yayın (bir yt-dlp + bir ffmpeg, herkese dağıtılır) ---------- */
-function startLive(S, e) {
-  S.clients = S.clients || new Set();
-  if (!FFMPEG_OK) { say(S, null, '⛔ Sunucu modu için sunucuda ffmpeg gerekli (npm i ffmpeg-static).'); return; }
-  if (e.track.direct) {
-    const d = spawnDirect(e.track, true); let bytes = 0; S.proc = [d.f];
-    d.f.stdout.on('data', c => { bytes += c.length; for (const r of S.clients) { if (r.writableLength < (1 << 20)) r.write(c); } });
-    d.f.on('close', () => {
-      if (S.gen !== e.gen) return;
-      if (!bytes) { console.error('Audius akışı boş:', d.errF); say(S, null, '⛔ Ses akışı alınamadı: ' + cut(d.errF.trim().split('\n').pop() || 'bilinmeyen hata', 180)); }
-      playNext(S, null);
-    });
-    return;
-  }
-  let bytes = 0, errY = '', errF = '';
-  const y = spawn(YTDLP, ['-f', 'bestaudio/best', '--no-playlist', '--no-warnings', '-q', ...YT_ARGS, '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'pipe'] });
-  const f = spawn(FFMPEG, ['-loglevel', 'error', '-re', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-ar', '44100', '-ac', '2', '-b:a', '192k', '-flush_packets', '1', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
-  y.stderr.on('data', d => { errY = (errY + d).slice(-600); }); f.stderr.on('data', d => { errF = (errF + d).slice(-600); });
-  y.on('error', er => { errY += 'yt-dlp başlatılamadı: ' + er.message; }); f.on('error', er => { errF += 'ffmpeg başlatılamadı: ' + er.message; });
-  y.stdout.on('error', () => {}); f.stdin.on('error', () => {}); y.stdout.pipe(f.stdin);
-  S.proc = [y, f];
-  f.stdout.on('data', c => {
-    bytes += c.length;
-    for (const r of S.clients) { if (r.writableLength < (1 << 20)) r.write(c); }
-  });
-  f.on('close', () => {
-    if (S.gen !== e.gen) return; // geçildi/durduruldu
-    if (!bytes) {
-      const why = errY.trim().split('\n').pop() || errF.trim().split('\n').pop() || 'bilinmeyen hata';
-      console.error('akış boş:', errY, errF);
-      say(S, null, '⛔ Ses akışı alınamadı: ' + cut(why, 180));
-    }
-    playNext(S, null); // şarkı bitti (ya da hata): sıradakine geç
-  });
-}
-
-/* ---------- HTTP: ses akışı ---------- */
-const server = http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
-  const m = /^\/s\/([a-f0-9]{24})\.mp3$/.exec(req.url.split('?')[0]);
-  if (!m) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('budd muzik botu calisiyor'); }
-  const e = tokens.get(m[1]);
-  if (!e || e.S.gen !== e.gen) { res.writeHead(404); return res.end(); }
-  const S = e.S;
-  if (S.srv) { // ortak canlı yayına katıl
-    res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
-    S.clients = S.clients || new Set(); S.clients.add(res); res.on('close', () => S.clients.delete(res)); return;
-  }
-  if (S.proc) for (const p of S.proc) { try { p.kill('SIGKILL'); } catch {} } // yeniden istek: baştan başlat
-  const T0 = Date.now();
-  let bytes = 0, closed = false, attempt = 0;
-  res.writeHead(200, { 'Content-Type': FFMPEG_OK ? 'audio/mpeg' : 'audio/webm', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
-  res.on('close', () => { closed = true; killStream2(); });
-  let cur = [];
-  const killStream2 = () => { for (const p of cur) { try { p.kill('SIGKILL'); } catch {} } };
-  // Önce eski (çalışan) yöntem: ek ayar yok. Ses gelmezse YT_ARGS ile tekrar dene.
-  const run = () => {
-    if (e.track.direct && FFMPEG_OK) { // Audius: yt-dlp'siz
-      const d = spawnDirect(e.track, false); let got = 0; cur = [d.f]; S.proc = cur;
-      d.f.stdout.on('data', c => { got += c.length; if (!bytes) armTimer(S, e.gen); bytes += c.length; if (!closed) res.write(c); });
-      d.f.on('close', () => {
-        if (closed || S.gen !== e.gen) return; closed = true; res.end();
-        if (!got) say(S, null, '⛔ Ses akışı alınamadı: ' + cut(d.errF.trim().split('\n').pop() || 'bilinmeyen hata', 180));
-        else if (!e.track.dur) setTimeout(() => { if (S.gen === e.gen) playNext(S, null); }, 1500);
-      });
-      return;
-    }
-    const extra = YT_ARGS;
-    let errY = '', errF = '', got = 0;
-    const y = spawn(YTDLP, ['-f', FFMPEG_OK ? 'bestaudio/best' : 'bestaudio[ext=webm]/bestaudio', '--no-playlist', '--no-warnings', '-q', ...extra, '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'pipe'] });
-    y.stderr.on('data', d => { errY = (errY + d).slice(-600); });
-    y.on('error', er => { errY += 'yt-dlp başlatılamadı: ' + er.message; });
-    y.stdout.on('error', () => {});
-    let out = y.stdout, f = null;
-    cur = [y];
-    if (FFMPEG_OK) {
-      f = spawn(FFMPEG, ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-ar', '44100', '-ac', '2', '-b:a', '192k', '-flush_packets', '1', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
-      f.stderr.on('data', d => { errF = (errF + d).slice(-600); });
-      f.on('error', er => { errF += 'ffmpeg başlatılamadı: ' + er.message; });
-      y.stdout.pipe(f.stdin); f.stdin.on('error', () => {});
-      out = f.stdout; cur = [y, f];
-    }
-    S.proc = cur;
-    out.on('data', c => { got += c.length; if (!bytes) { console.log('akış başladı', Date.now() - T0, 'ms'); armTimer(S, e.gen); } bytes += c.length; if (!closed) res.write(c); });
-    (f || y).on('close', () => {
-      if (closed || S.gen !== e.gen) return;
-            closed = true; res.end();
-      if (!got) {
-        const why = (errY.trim().split('\n').pop() || errF.trim().split('\n').pop() || 'bilinmeyen hata');
-        console.error('akış boş döndü:', errY, errF);
-        say(S, null, '⛔ Ses akışı alınamadı (yt-dlp): ' + cut(why, 180));
-      } else if (!e.track.dur) setTimeout(() => { if (S.gen === e.gen) playNext(S, null); }, 1500);
-    });
+function guessView(g) {
+  const p = g.guesses[g.gi];
+  const id = (x) => `aki:${g.owner}:${x}`;
+  return {
+    embeds: [{
+      title: "🧞 Aklındaki kişi/karakter bu mu?",
+      description: `**${p.name}**\n${p.description || ""}`,
+      color: COLOR,
+      image: p.absolute_picture_path ? { url: p.absolute_picture_path } : undefined,
+      footer: { text: `Oyuncu: ${g.name}` },
+    }],
+    components: [row(btn("Evet, bu!", id("yes"), 3), btn("Hayır", id("no"), 4))],
   };
-  run();
+}
+
+const endView = (title, text, img) => ({
+  embeds: [{ title, description: text, color: COLOR, image: img ? { url: img } : undefined }],
+  components: [],
 });
 
-/* ---------- WebSocket gateway ---------- */
-const wss = new WebSocketServer({ server });
-wss.on('connection', ws => {
-  let S = { ws, q: [], cur: null, loop: false, vol: 0.6, gen: 0, timer: null, proc: null, token: null,
-    paused: false, left: null, t0: 0, searches: new Map(), oda: '' };
-  sessions.set(ws, S);
-  const ping = setInterval(() => send(S, { op: 'ping' }), 25000);
-  ws.on('message', raw => {
-    let m; try { m = JSON.parse(raw); } catch { return; }
-    if (m.op === 'identify') return send(S, { op: 'ready' });
-    if (m.op !== 'interaction' || !m.d) return;
-    const d = m.d;
-    const user = d.user && d.user.username;
-    const g = d.guild || {};
-    if (g.fb && g.id && okFb(g.fb)) { // sunucu modu: oturum Budd sekmesinden bağımsız yaşar
-      const G = guilds.get(g.id);
-      if (G && G !== S) { clearInterval(ping); S.dead = true; sessions.delete(ws); G.ws = ws; sessions.set(ws, G); S = G; }
-      S.srv = true; S.gid = g.id; S.fb = String(g.fb).replace(/\/+$/, ''); S.chans = g.channels || []; S.uvc = g.vc || '';
-      if (d.bot && d.bot.id) S.bot = d.bot; else if (!S.bot) S.bot = { id: 'bot', name: 'Bot' };
-      guilds.set(g.id, S);
+// ---------- oyun mantığı ----------
+async function maybeGuess(g) {
+  const a = g.aki;
+  if (a.progress < g.threshold && a.currentStep < MAX_STEP) return questionView(g);
+  await a.win();
+  g.guesses = Array.isArray(a.answers) ? a.answers.slice(0, 3) : [];
+  g.gi = 0;
+  if (!g.guesses.length) return lose(g);
+  g.guessing = true;
+  return guessView(g);
+}
+
+function lose(g) {
+  games.delete(g.k);
+  return endView("🧞 Bu sefer bilemedim", "Beni yendin! Tekrar denemek için `/akinator` yaz.");
+}
+
+async function start(b) {
+  const aki = new Aki({ region: REGION });
+  await aki.start();
+  const g = {
+    k: key(b), owner: b.user.id, name: b.user.username, aki,
+    threshold: GUESS_AT, guessing: false, guesses: [], gi: 0, t: Date.now(),
+  };
+  games.set(g.k, g);
+  return questionView(g);
+}
+
+async function onComponent(b) {
+  const [, owner, act] = String(b.data.custom_id || "").split(":");
+  if (b.user.id !== owner)
+    return { content: "Bu oyun sana ait değil. Kendi oyununu `/akinator` ile başlat.", flags: 64 };
+
+  const g = games.get(key(b));
+  if (!g) return { update: true, ...endView("🧞 Oyun sona erdi", "Süre doldu. Yeni oyun için `/akinator` yaz.") };
+  g.t = Date.now();
+
+  if (act === "stop") { games.delete(g.k); return { update: true, ...endView("🧞 Oyun bitirildi", "Tekrar oynamak için `/akinator` yaz.") }; }
+
+  if (g.guessing) {
+    if (act === "yes") {
+      const p = g.guesses[g.gi];
+      games.delete(g.k);
+      return { update: true, ...endView("🧞 Yine bildim! 🎉", `**${p.name}**\n${p.description || ""}`, p.absolute_picture_path) };
     }
-    if (d.type === 'command' && d.data) {
-      onCommand(S, d.id, d.data.name, d.data.options || {}, d.data.args || [], user)
-        .catch(e => say(S, d.id, '⛔ ' + e.message));
-    } else if (d.type === 'component' && d.data) {
-      onComponent(S, d.id, d.data, user)
-        .catch(e => say(S, d.id, '⛔ ' + e.message, null, { flags: 64 }));
+    if (act === "no") {
+      g.gi++;
+      if (g.gi < g.guesses.length) return { update: true, ...guessView(g) };
+      if (g.aki.currentStep >= MAX_STEP) return { update: true, ...lose(g) };
+      g.guessing = false;           // devam et, daha emin olunca tekrar tahmin eder
+      g.threshold = 95;
+      return { update: true, ...questionView(g) };
     }
-  });
-  ws.on('close', () => {
-    clearInterval(ping); sessions.delete(ws);
-    if (S.dead) return;
-    if (S.srv) { // sekme kapandı: bot çalmaya devam eder; boşta kalırsa 10 dk sonra ayrılır
-      if (S.ws === ws) S.ws = null;
-      clearTimeout(S.idle); S.idle = setTimeout(() => { if (!S.ws && !S.cur && !S.q.length) { srvLeave(S); guilds.delete(S.gid); } }, 600000);
-      return;
-    }
-    killStream(S);
-  });
+    return { update: true, ...guessView(g) };
+  }
+
+  if (act === "back") {
+    if (g.aki.currentStep > 0) await g.aki.back();
+    return { update: true, ...questionView(g) };
+  }
+  const n = /^a([0-4])$/.exec(act || "");
+  if (!n) return { update: true, ...questionView(g) };
+  await g.aki.step(Number(n[1]));
+  return { update: true, ...(await maybeGuess(g)) };
+}
+
+// ---------- sunucu ----------
+const app = express();
+app.use(cors(), express.json());
+
+app.get("/", (_q, r) => r.send("Akinator botu çalışıyor."));
+
+app.post(BOT_PATH, async (req, res) => {
+  const b = req.body || {};
+  if (APP_ID && req.get("X-Budd-App-Id") !== APP_ID) return res.status(401).json({});
+  try {
+    if (b.type === "ping") return res.json({ type: "ping" });
+
+    if (b.type === "command" && ["akinator", "aki"].includes(b.data?.name))
+      return res.json(await start(b));
+
+    if (b.type === "component" && String(b.data?.custom_id || "").startsWith("aki:"))
+      return res.json(await onComponent(b));
+
+    res.json({});
+  } catch (e) {
+    console.error("Hata:", e?.message || e);
+    if (b.user) games.delete(key(b));
+    res.json({
+      content: "Akinator şu an cevap vermiyor (bağlantı hatası). Birazdan tekrar dene.",
+      flags: 64,
+    });
+  }
 });
 
-server.listen(PORT, () => console.log(`Budd müzik botu :${PORT}  (public: ${PUBLIC})`));
-process.on('unhandledRejection', e => console.error(e));
+app.listen(PORT, () => console.log(`Akinator botu :${PORT}${BOT_PATH} üzerinde hazır`));
+        
