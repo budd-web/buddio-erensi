@@ -376,4 +376,96 @@ function startLive(S, e) {
 /* ---------- HTTP: ses akışı ---------- */
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeade
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+  const m = /^\/s\/([a-f0-9]{24})\.mp3$/.exec(req.url.split('?')[0]);
+  if (!m) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('budd muzik botu calisiyor'); }
+  const e = tokens.get(m[1]);
+  if (!e || e.S.gen !== e.gen) { res.writeHead(404); return res.end(); }
+  const S = e.S;
+  if (S.srv) { // ortak canlı yayına katıl
+    res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
+    S.clients = S.clients || new Set(); S.clients.add(res); res.on('close', () => S.clients.delete(res)); return;
+  }
+  if (S.proc) for (const p of S.proc) { try { p.kill('SIGKILL'); } catch {} } // yeniden istek: baştan başlat
+  const T0 = Date.now();
+  let bytes = 0, closed = false, attempt = 0;
+  res.writeHead(200, { 'Content-Type': FFMPEG_OK ? 'audio/mpeg' : 'audio/webm', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
+  res.on('close', () => { closed = true; killStream2(); });
+  let cur = [];
+  const killStream2 = () => { for (const p of cur) { try { p.kill('SIGKILL'); } catch {} } };
+  // Önce eski (çalışan) yöntem: ek ayar yok. Ses gelmezse YT_ARGS ile tekrar dene.
+  const run = () => {
+    const extra = YT_ARGS;
+    let errY = '', errF = '', got = 0;
+    const y = spawn(YTDLP, ['-f', FFMPEG_OK ? 'bestaudio/best' : 'bestaudio[ext=webm]/bestaudio', '--no-playlist', '--no-warnings', '-q', ...extra, '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'pipe'] });
+    y.stderr.on('data', d => { errY = (errY + d).slice(-600); });
+    y.on('error', er => { errY += 'yt-dlp başlatılamadı: ' + er.message; });
+    y.stdout.on('error', () => {});
+    let out = y.stdout, f = null;
+    cur = [y];
+    if (FFMPEG_OK) {
+      f = spawn(FFMPEG, ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-ar', '44100', '-ac', '2', '-b:a', '192k', '-flush_packets', '1', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      f.stderr.on('data', d => { errF = (errF + d).slice(-600); });
+      f.on('error', er => { errF += 'ffmpeg başlatılamadı: ' + er.message; });
+      y.stdout.pipe(f.stdin); f.stdin.on('error', () => {});
+      out = f.stdout; cur = [y, f];
+    }
+    S.proc = cur;
+    out.on('data', c => { got += c.length; if (!bytes) { console.log('akış başladı', Date.now() - T0, 'ms'); armTimer(S, e.gen); } bytes += c.length; if (!closed) res.write(c); });
+    (f || y).on('close', () => {
+      if (closed || S.gen !== e.gen) return;
+            closed = true; res.end();
+      if (!got) {
+        const why = (errY.trim().split('\n').pop() || errF.trim().split('\n').pop() || 'bilinmeyen hata');
+        console.error('akış boş döndü:', errY, errF);
+        say(S, null, '⛔ Ses akışı alınamadı (yt-dlp): ' + cut(why, 180));
+      } else if (!e.track.dur) setTimeout(() => { if (S.gen === e.gen) playNext(S, null); }, 1500);
+    });
+  };
+  run();
+});
+
+/* ---------- WebSocket gateway ---------- */
+const wss = new WebSocketServer({ server });
+wss.on('connection', ws => {
+  let S = { ws, q: [], cur: null, loop: false, vol: 0.6, gen: 0, timer: null, proc: null, token: null,
+    paused: false, left: null, t0: 0, searches: new Map(), oda: '' };
+  sessions.set(ws, S);
+  const ping = setInterval(() => send(S, { op: 'ping' }), 25000);
+  ws.on('message', raw => {
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    if (m.op === 'identify') return send(S, { op: 'ready' });
+    if (m.op !== 'interaction' || !m.d) return;
+    const d = m.d;
+    const user = d.user && d.user.username;
+    const g = d.guild || {};
+    if (g.fb && g.id && okFb(g.fb)) { // sunucu modu: oturum Budd sekmesinden bağımsız yaşar
+      const G = guilds.get(g.id);
+      if (G && G !== S) { clearInterval(ping); S.dead = true; sessions.delete(ws); G.ws = ws; sessions.set(ws, G); S = G; }
+      S.srv = true; S.gid = g.id; S.fb = String(g.fb).replace(/\/+$/, ''); S.chans = g.channels || []; S.uvc = g.vc || '';
+      if (d.bot && d.bot.id) S.bot = d.bot; else if (!S.bot) S.bot = { id: 'bot', name: 'Bot' };
+      guilds.set(g.id, S);
+    }
+    if (d.type === 'command' && d.data) {
+      onCommand(S, d.id, d.data.name, d.data.options || {}, d.data.args || [], user)
+        .catch(e => say(S, d.id, '⛔ ' + e.message));
+    } else if (d.type === 'component' && d.data) {
+      onComponent(S, d.id, d.data, user)
+        .catch(e => say(S, d.id, '⛔ ' + e.message, null, { flags: 64 }));
+    }
+  });
+  ws.on('close', () => {
+    clearInterval(ping); sessions.delete(ws);
+    if (S.dead) return;
+    if (S.srv) { // sekme kapandı: bot çalmaya devam eder; boşta kalırsa 10 dk sonra ayrılır
+      if (S.ws === ws) S.ws = null;
+      clearTimeout(S.idle); S.idle = setTimeout(() => { if (!S.ws && !S.cur && !S.q.length) { srvLeave(S); guilds.delete(S.gid); } }, 600000);
+      return;
+    }
+    killStream(S);
+  });
+});
+
+server.listen(PORT, () => console.log(`Budd müzik botu :${PORT}  (public: ${PUBLIC})`));
+process.on('unhandledRejection', e => console.error(e));
