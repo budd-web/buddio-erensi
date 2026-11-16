@@ -97,18 +97,74 @@ async function smartSearch(q) { return { src: 'sc', items: await searchList('sc'
 
 /* ---------- oturumlar (her Budd bağlantısı bir oturum) ---------- */
 const sessions = new Map(); // ws -> S
+const guilds = new Map();   // sunucu(guild) id -> S  (sunucu modunda oturum, Budd sekmesi kapansa da yaşar)
 const tokens = new Map();   // token -> { S, track, gen }
 
-function send(S, o) { if (S.ws.readyState === 1) S.ws.send(JSON.stringify(o)); }
+function send(S, o) { if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(o)); }
+
+/* ---------- SUNUCU MODU: bot sesli odaya gerçek üye gibi girer ----------
+ * Budd, her komutla Firebase adresini ve sunucu bilgisini yollar. Bot burada:
+ *  - Firebase'e "bot_<id>" üyesi olarak yazılır (ad, profil, durum) ve her 15 sn tazelenir,
+ *  - şarkıyı BİR kez çözüp herkese ortak canlı mp3 yayını yapar, adresini /bplay'e yazar,
+ *  - odadaki herkes bu yayını dinler; kimse olmasa da şarkılar sırayla akmaya devam eder,
+ *  - komutu veren kişi odadan çıksa, Budd sekmesini kapatsa da bot çalmayı sürdürür. */
+const okFb = u => process.env.ALLOW_ANY_FB === '1' || /^https:\/\/[\w.-]+\.(firebaseio\.com|firebasedatabase\.app)\/?$/i.test(String(u || ''));
+function fbw(S, p, method, body) {
+  if (!S.fb || !S.gid) return;
+  fetch(`${S.fb}/budd/${encodeURIComponent(S.gid)}${p}.json`, { method, body: body === undefined ? undefined : JSON.stringify(body) }).catch(() => {});
+}
+function pickCh(S) {
+  const v = (S.chans || []).filter(c => c.type === 'voice');
+  const want = String(S.oda || '').replace(/^#/, '').toLowerCase();
+  return (want && (v.find(c => c.id === S.oda || String(c.name).toLowerCase() === want) || {}).id)
+    || (v.find(c => c.id === S.uvc) || {}).id || (v[0] || {}).id || '';
+}
+function presence(S) {
+  if (!S.ch || !S.joined) return;
+  const b = S.bot || {};
+  fbw(S, `/voice/${S.ch}/bot_${b.id}`, 'PUT', { n: cut(b.name || 'Bot', 32), ts: Date.now(), bot: 1, mu: S.cur && !S.pa ? 0 : 1, c: b.color || '', im: b.img || '' });
+}
+function bplayPut(S) {
+  if (!S.ch || !S.play) return;
+  fbw(S, `/bplay/${S.ch}`, 'PUT', { url: S.play.url, v: S.vol, ts: S.play.ts, by: cut((S.bot || {}).name, 20), bid: (S.bot || {}).id, live: 1, pa: S.pa ? Date.now() : 0 });
+}
+function srvJoin(S) {
+  const ch = pickCh(S);
+  if (!ch) return false;
+  if (S.joined && S.ch && S.ch !== ch) srvLeave(S, true);
+  S.ch = ch; S.joined = true;
+  presence(S);
+  if (!S.hb) S.hb = setInterval(() => { presence(S); bplayPut(S); }, 15000);
+  return true;
+}
+function srvLeave(S, keepSession) {
+  if (S.ch) { fbw(S, `/bplay/${S.ch}`, 'DELETE'); fbw(S, `/voice/${S.ch}/bot_${(S.bot || {}).id}`, 'DELETE'); }
+  clearInterval(S.hb); S.hb = null; S.joined = false; S.play = null; S.pa = false;
+  if (!keepSession) S.ch = '';
+}
+function sigProc(S, sig) { if (S.proc) for (const p of S.proc) { try { p.kill(sig); } catch {} } }
+function endClients(S) { if (S.clients) { for (const r of S.clients) { try { r.end(); } catch {} } S.clients.clear(); } }
+// Eylemler: sunucu modunda Firebase'e, eski modda Budd'a (tarayıcıda çalan) gider
+function act(S, d) {
+  if (!S.srv) return send(S, { op: 'action', d });
+  switch (d.act) {
+    case 'join': srvJoin(S); break;
+    case 'stop': S.play = null; S.pa = false; if (S.ch) fbw(S, `/bplay/${S.ch}`, 'DELETE'); presence(S); if (!S.ws && !S.q.length) { clearTimeout(S.idle); S.idle = setTimeout(() => { if (!S.ws && !S.cur && !S.q.length) { srvLeave(S); guilds.delete(S.gid); } }, 600000); } break;
+    case 'leave': srvLeave(S); break;
+    case 'pause': sigProc(S, 'SIGSTOP'); presence(S); bplayPut(S); break;
+    case 'resume': sigProc(S, 'SIGCONT'); presence(S); bplayPut(S); break;
+    case 'volume': bplayPut(S); break;
+  }
+}
 function say(S, replyTo, content, embed, extra) {
   send(S, { op: 'message', d: Object.assign({ reply_to: replyTo, content: content || '' }, embed ? { embeds: [embed] } : {}, extra || {}) });
 }
 function killStream(S) {
-  clearTimeout(S.timer); S.timer = null;
+  clearTimeout(S.timer); S.timer = null; endClients(S);
   if (S.proc) { for (const p of S.proc) { try { p.kill('SIGKILL'); } catch {} } S.proc = null; }
   if (S.token) { tokens.delete(S.token); S.token = null; }
 }
-function stopAll(S) { S.gen++; S.paused = false; killStream(S); S.cur = null; send(S, { op: 'action', d: { act: 'stop' } }); }
+function stopAll(S) { S.gen++; S.paused = false; killStream(S); S.cur = null; act(S, { act: 'stop' }); }
 
 // "Çalıyor" mesajının altındaki kontrol butonları
 const CTL = [{ type: 1, components: [
@@ -122,11 +178,14 @@ function playNext(S, replyTo) {
   killStream(S);
   if (S.loop && S.cur) S.q.unshift(S.cur);
   S.cur = S.q.shift() || null;
-  S.gen++; S.paused = false; S.left = null;
-  if (!S.cur) { send(S, { op: 'action', d: { act: 'stop' } }); return; }
+  S.gen++; S.paused = false; S.pa = false; S.left = null;
+  if (!S.cur) { act(S, { act: 'stop' }); return; }
   const token = crypto.randomBytes(12).toString('hex');
-  S.token = token; tokens.set(token, { S, track: S.cur, gen: S.gen });
-  send(S, { op: 'action', d: { act: 'play', url: `${PUBLIC}/s/${token}.mp3`, v: S.vol } });
+  S.token = token; const ent = { S, track: S.cur, gen: S.gen }; tokens.set(token, ent);
+  if (S.srv) {
+    S.play = { url: `${PUBLIC}/s/${token}.mp3`, ts: Date.now() };
+    startLive(S, ent); bplayPut(S); presence(S);
+  } else send(S, { op: 'action', d: { act: 'play', url: `${PUBLIC}/s/${token}.mp3`, v: S.vol } });
   say(S, replyTo, '', {
     title: '🎶 Çalıyor', description: `**${S.cur.title}**`, color: 0x5865f2,
     thumbnail: S.cur.thumb ? { url: S.cur.thumb } : undefined,
@@ -143,19 +202,19 @@ function armTimer(S, gen) {
 }
 function pauseOn(S) {
   if (S.paused) return false;
-  S.paused = true;
+  S.paused = true; S.pa = true;
   if (S.timer) { clearTimeout(S.timer); S.timer = null; S.left = Math.max(0, S.left - (Date.now() - S.t0)); }
-  send(S, { op: 'action', d: { act: 'pause' } });
+  act(S, { act: 'pause' });
   return true;
 }
 function pauseOff(S) {
   if (!S.paused) return false;
-  S.paused = false;
+  S.paused = false; S.pa = false;
   if (S.left != null && S.cur && S.cur.dur) {
     const gen = S.gen; S.t0 = Date.now();
     S.timer = setTimeout(() => { if (S.gen === gen) playNext(S, null); }, S.left);
   }
-  send(S, { op: 'action', d: { act: 'resume' } });
+  act(S, { act: 'resume' });
   return true;
 }
 
@@ -190,7 +249,7 @@ async function addTrack(S, replyTo, track, user, chName) {
   // süre/kapak eksikse tam bilgiyi çek
   track.req = user || 'biri';
   // Bot sesli odaya girer: adı + profiliyle görünür, kendini sessize alır, sağırlaştırır (oda boşsa ilk ses kanalı)
-  send(S, { op: 'action', d: { act: 'join', ch: chName || '', mute: true, deaf: true } });
+  S.oda = chName || S.oda; act(S, { act: 'join', ch: chName || '', mute: true, deaf: true });
   S.q.push(track);
   if (!S.cur) playNext(S, replyTo);
   else say(S, replyTo, `➕ Sıraya eklendi: **${track.title}** (${fmt(track.dur)})`);
@@ -234,7 +293,7 @@ async function onCommand(S, id, name, opts, args, user) {
     case 'devam': if (!S.cur) return r('Çalan şarkı yok.'); r(pauseOff(S) ? '▶️ Devam ediyor.' : 'Oynatıcı zaten duraklatılmamış.'); break;
     case 'ses': {
       const v = Math.max(1, Math.min(100, +opts.seviye || +(args || [])[0] || 50));
-      S.vol = v / 100; send(S, { op: 'action', d: { act: 'volume', v: S.vol } }); r(`🔊 Ses: %${v}`); break;
+      S.vol = v / 100; act(S, { act: 'volume', v: S.vol }); r(`🔊 Ses: %${v}`); break;
     }
     case 'dongu': S.loop = !S.loop; r(S.loop ? '🔁 Döngü açık.' : '➡️ Döngü kapalı.'); break;
     case 'simdi': r(S.cur ? `🎶 **${S.cur.title}** (${fmt(S.cur.dur)}) – ${S.cur.by}` : 'Şu an bir şey çalmıyor.'); break;
@@ -242,7 +301,7 @@ async function onCommand(S, id, name, opts, args, user) {
       const l = S.q.slice(0, 10).map((t, i) => `${i + 1}. ${t.title} (${fmt(t.dur)})`).join('\n');
       r((S.cur ? `🎶 Şimdi: **${S.cur.title}**\n` : '') + (l || 'Sıra boş.')); break;
     }
-    case 'cik': stopAll(S); S.q = []; send(S, { op: 'action', d: { act: 'leave' } }); r('👋 Çıkıldı.'); break;
+    case 'cik': stopAll(S); S.q = []; act(S, { act: 'leave' }); r('👋 Çıkıldı.'); break;
   }
 }
 
@@ -275,6 +334,32 @@ async function onComponent(S, id, data, user) {
   }
 }
 
+/* ---------- sunucu modu: ortak canlı yayın (bir yt-dlp + bir ffmpeg, herkese dağıtılır) ---------- */
+function startLive(S, e) {
+  S.clients = S.clients || new Set();
+  if (!FFMPEG_OK) { say(S, null, '⛔ Sunucu modu için sunucuda ffmpeg gerekli (npm i ffmpeg-static).'); return; }
+  let bytes = 0, errY = '', errF = '';
+  const y = spawn(YTDLP, ['-f', 'bestaudio/best', '--no-playlist', '--no-warnings', '-q', '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const f = spawn(FFMPEG, ['-loglevel', 'error', '-re', '-fflags', 'nobuffer', '-probesize', '32768', '-analyzeduration', '0', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-flush_packets', '1', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  y.stderr.on('data', d => { errY = (errY + d).slice(-600); }); f.stderr.on('data', d => { errF = (errF + d).slice(-600); });
+  y.on('error', er => { errY += 'yt-dlp başlatılamadı: ' + er.message; }); f.on('error', er => { errF += 'ffmpeg başlatılamadı: ' + er.message; });
+  y.stdout.on('error', () => {}); f.stdin.on('error', () => {}); y.stdout.pipe(f.stdin);
+  S.proc = [y, f];
+  f.stdout.on('data', c => {
+    bytes += c.length;
+    for (const r of S.clients) { if (r.writableLength < (1 << 20)) r.write(c); }
+  });
+  f.on('close', () => {
+    if (S.gen !== e.gen) return; // geçildi/durduruldu
+    if (!bytes) {
+      const why = errY.trim().split('\n').pop() || errF.trim().split('\n').pop() || 'bilinmeyen hata';
+      console.error('akış boş:', errY, errF);
+      say(S, null, '⛔ Ses akışı alınamadı: ' + cut(why, 180));
+    }
+    playNext(S, null); // şarkı bitti (ya da hata): sıradakine geç
+  });
+}
+
 /* ---------- HTTP: ses akışı ---------- */
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -285,69 +370,11 @@ const server = http.createServer((req, res) => {
   const e = tokens.get(m[1]);
   if (!e || e.S.gen !== e.gen) { res.writeHead(404); return res.end(); }
   const S = e.S;
+  if (S.srv) { // ortak canlı yayına katıl
+    res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
+    S.clients = S.clients || new Set(); S.clients.add(res); res.on('close', () => S.clients.delete(res)); return;
+  }
   if (S.proc) for (const p of S.proc) { try { p.kill('SIGKILL'); } catch {} } // yeniden istek: baştan başlat
   const T0 = Date.now();
   let bytes = 0, closed = false, attempt = 0;
-  res.writeHead(200, { 'Content-Type': FFMPEG_OK ? 'audio/mpeg' : 'audio/webm', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none' });
-  res.on('close', () => { closed = true; killStream2(); });
-  let cur = [];
-  const killStream2 = () => { for (const p of cur) { try { p.kill('SIGKILL'); } catch {} } };
-  // Önce eski (çalışan) yöntem: ek ayar yok. Ses gelmezse YT_ARGS ile tekrar dene.
-  const run = () => {
-    const extra = attempt === 0 ? [] : YT_ARGS;
-    let errY = '', errF = '', got = 0;
-    const y = spawn(YTDLP, ['-f', FFMPEG_OK ? 'bestaudio/best' : 'bestaudio[ext=webm]/bestaudio', '--no-playlist', '--no-warnings', '-q', ...extra, '-o', '-', '--', e.track.url], { stdio: ['ignore', 'pipe', 'pipe'] });
-    y.stderr.on('data', d => { errY = (errY + d).slice(-600); });
-    y.on('error', er => { errY += 'yt-dlp başlatılamadı: ' + er.message; });
-    y.stdout.on('error', () => {});
-    let out = y.stdout, f = null;
-    cur = [y];
-    if (FFMPEG_OK) {
-      f = spawn(FFMPEG, ['-loglevel', 'error', '-fflags', 'nobuffer', '-flags', 'low_delay', '-probesize', '32768', '-analyzeduration', '0', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-flush_packets', '1', '-f', 'mp3', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
-      f.stderr.on('data', d => { errF = (errF + d).slice(-600); });
-      f.on('error', er => { errF += 'ffmpeg başlatılamadı: ' + er.message; });
-      y.stdout.pipe(f.stdin); f.stdin.on('error', () => {});
-      out = f.stdout; cur = [y, f];
-    }
-    S.proc = cur;
-    out.on('data', c => { got += c.length; if (!bytes) { console.log('akış başladı', Date.now() - T0, 'ms'); armTimer(S, e.gen); } bytes += c.length; if (!closed) res.write(c); });
-    (f || y).on('close', () => {
-      if (closed || S.gen !== e.gen) return;
-            closed = true; res.end();
-      if (!got) {
-        const why = (errY.trim().split('\n').pop() || errF.trim().split('\n').pop() || 'bilinmeyen hata');
-        console.error('akış boş döndü:', errY, errF);
-        say(S, null, '⛔ Ses akışı alınamadı (yt-dlp): ' + cut(why, 180));
-      } else if (!e.track.dur) setTimeout(() => { if (S.gen === e.gen) playNext(S, null); }, 1500);
-    });
-  };
-  run();
-});
-
-/* ---------- WebSocket gateway ---------- */
-const wss = new WebSocketServer({ server });
-wss.on('connection', ws => {
-  const S = { ws, q: [], cur: null, loop: false, vol: 0.6, gen: 0, timer: null, proc: null, token: null,
-    paused: false, left: null, t0: 0, searches: new Map(), oda: '' };
-  sessions.set(ws, S);
-  const ping = setInterval(() => send(S, { op: 'ping' }), 25000);
-  ws.on('message', raw => {
-    let m; try { m = JSON.parse(raw); } catch { return; }
-    if (m.op === 'identify') return send(S, { op: 'ready' });
-    if (m.op !== 'interaction' || !m.d) return;
-    const d = m.d;
-    const user = d.user && d.user.username;
-    if (d.type === 'command' && d.data) {
-      onCommand(S, d.id, d.data.name, d.data.options || {}, d.data.args || [], user)
-        .catch(e => say(S, d.id, '⛔ ' + e.message));
-    } else if (d.type === 'component' && d.data) {
-      onComponent(S, d.id, d.data, user)
-        .catch(e => say(S, d.id, '⛔ ' + e.message, null, { flags: 64 }));
-    }
-  });
-  ws.on('close', () => { clearInterval(ping); killStream(S); sessions.delete(ws); });
-});
-
-server.listen(PORT, () => console.log(`Budd müzik botu :${PORT}  (public: ${PUBLIC})`));
-process.on('unhandledRejection', e => console.error(e));
-    
+  res.writeHead(200, { 'Content-Type': FFMPEG_OK ? 'audio/mpeg'
