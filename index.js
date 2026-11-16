@@ -145,6 +145,7 @@ app.get("/", (_q, r) => r.send("Akinator botu çalışıyor."));
 
 app.post(BOT_PATH, async (req, res) => {
   const b = req.body || {};
+  console.log("İstek:", b.type, b.data?.name || b.data?.custom_id || "");
   if (APP_ID && req.get("X-Budd-App-Id") !== APP_ID) return res.status(401).json({});
   try {
     if (b.type === "ping") return res.json({ type: "ping" });
@@ -160,11 +161,10 @@ app.post(BOT_PATH, async (req, res) => {
     console.error("Hata:", e?.message || e);
     if (b.user) games.delete(key(b));
     res.json({
-      content: "Akinator şu an cevap vermiyor (bağlantı hatası). Birazdan tekrar dene.",
+      content: "Akinator hatası: " + String(e?.message || e).slice(0, 300),
       flags: 64,
     });
   }
 });
 
 app.listen(PORT, () => console.log(`Akinator botu :${PORT}${BOT_PATH} üzerinde hazır`));
-        
